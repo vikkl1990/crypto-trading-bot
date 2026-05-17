@@ -97,8 +97,10 @@ PRODUCT_MAP = {
         "demo_id": 101555,
         "prod_id": 14745,
         "symbol": "DOGEUSD",
-        "contract_size": 1.0,
-        "tick_size": 0.000001,     # prod API: 0.000001 (was 0.00001 — FIXED)
+        "contract_size": 1.0,          # prod: 1 lot = 1 DOGE
+        "contract_size_demo": 100.0,   # testnet: 1 lot = 100 DOGE (verified 2026-04-22
+                                       # via GET /v2/products contract_value=100)
+        "tick_size": 0.000001,
         "tick_size_demo": 0.000001,
     },
     "LINK/USDT": {
@@ -119,10 +121,10 @@ PRODUCT_MAP = {
         "tick_size_demo": 0.0000001,
     },
     "SHIB/USDT": {
-        "demo_id": 0,
+        "demo_id": 162764,        # testnet-listed 2026-04-22 (was 0 since 2026-03-31)
         "prod_id": 114715,
         "symbol": "1000SHIBUSD",
-        "contract_size": 1000.0,  # 1 lot = 1000 SHIB
+        "contract_size": 1000.0,  # 1 lot = 1000 SHIB (1000x multiplier, same prod+demo)
         "tick_size": 0.000001,
         "tick_size_demo": 0.000001,
     },
@@ -174,12 +176,128 @@ PRODUCT_MAP = {
         "tick_size": 0.0001,
         "tick_size_demo": 0.0001,
     },
+    # ── Added 2026-04-16: meme perpetuals with real Delta India depth ──
+    # TRUMP: ~$400K top-5 depth, 1.1% ATR_1h — strongest meme liquidity on this venue
+    "TRUMP/USDT": {
+        "demo_id": 0,
+        "prod_id": 57227,
+        "symbol": "TRUMPUSD",
+        "contract_size": 0.1,       # 1 lot = 0.1 TRUMP
+        "tick_size": 0.001,
+        "tick_size_demo": 0.001,
+    },
+    # POPCAT: ~$73K top-5 depth, 1.55% ATR_1h
+    "POPCAT/USDT": {
+        "demo_id": 0,
+        "prod_id": 45540,
+        "symbol": "POPCATUSD",
+        "contract_size": 1.0,
+        "tick_size": 0.0001,
+        "tick_size_demo": 0.0001,
+    },
+    # MEME: marginal depth (~$600) but wide 1.66% ATR_1h. Keep under low_liquidity veto.
+    "MEME/USDT": {
+        "demo_id": 0,
+        "prod_id": 18286,
+        "symbol": "MEMEUSD",
+        "contract_size": 100.0,     # 1 lot = 100 MEME
+        "tick_size": 0.000001,
+        "tick_size_demo": 0.000001,
+    },
+    # 1MBABYDOGE: native symbol, 1M-multiplier. Thin today, left here for registry completeness.
+    "BABYDOGE/USDT": {
+        "demo_id": 0,
+        "prod_id": 50353,
+        "symbol": "1MBABYDOGEUSD",
+        "contract_size": 100.0,
+        "tick_size": 0.0000001,
+        "tick_size_demo": 0.0000001,
+    },
 }
 
 # Demo balance asset ID (USD on testnet)
 DEMO_BALANCE_ASSET_ID = 3
 # Production balance asset IDs to check
 PROD_BALANCE_ASSET_IDS = [14, 5, 3, 1, 2, 4, 6, 7]  # 14=USD on Delta India production
+
+
+def validate_product_map(mode: str = "demo") -> Dict:
+    """Phase 5.2 (2026-04-23) — startup probe to verify PRODUCT_MAP contract_size
+    and tick_size match Delta's live API. Catches silent drift like the SHIB
+    demo_id=0 bug and DOGE contract_size_demo=100 bug we hit earlier.
+
+    Args:
+        mode: "demo" or "live" (which Delta API to query)
+
+    Returns:
+        {"ok": [...], "mismatch": [...], "missing": [...], "errors": [...]}
+
+    Side effect: logs WARNING for each mismatch so they appear in journald
+    on startup. Does NOT raise — bot continues even on mismatch (the per-symbol
+    fields are read defensively at execution time).
+    """
+    import urllib.request as _ureq
+    import urllib.error as _uerr
+    import json
+
+    base = (
+        "https://cdn-ind.testnet.deltaex.org/v2/products"
+        if mode == "demo"
+        else "https://api.india.delta.exchange/v2/products"
+    )
+    report = {"ok": [], "mismatch": [], "missing": [], "errors": []}
+    id_key = "demo_id" if mode == "demo" else "prod_id"
+    cs_key = "contract_size_demo" if mode == "demo" else "contract_size"
+    ts_key = "tick_size_demo" if mode == "demo" else "tick_size"
+
+    # Fetch product list once (Delta returns ~600 products in a single call)
+    try:
+        req = _ureq.Request(base, headers={"User-Agent": "vnedge-validator/1.0"})
+        with _ureq.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+    except (_uerr.URLError, json.JSONDecodeError, OSError) as e:
+        logger.warning("PRODUCT_MAP validator: API fetch failed (%s) — skipped", e)
+        return {"ok": [], "mismatch": [], "missing": [], "errors": [str(e)]}
+
+    products_by_id = {int(p.get("id", 0)): p for p in payload.get("result", [])}
+
+    for sym, info in PRODUCT_MAP.items():
+        pid = int(info.get(id_key, 0) or 0)
+        if pid == 0:
+            continue  # symbol intentionally not on this venue
+        api = products_by_id.get(pid)
+        if not api:
+            report["missing"].append((sym, pid))
+            logger.warning("PRODUCT_MAP %s: %s=%d not found on %s", sym, id_key, pid, mode)
+            continue
+
+        # Falls back to top-level `contract_size` if mode-specific key absent
+        expected_cs = float(info.get(cs_key, info.get("contract_size", 0)) or 0)
+        expected_ts = float(info.get(ts_key, info.get("tick_size", 0)) or 0)
+        api_cs = float(api.get("contract_value", 0) or 0)
+        api_ts = float(api.get("tick_size", 0) or 0)
+
+        cs_ok = abs(expected_cs - api_cs) < 1e-9 if expected_cs > 0 else True
+        ts_ok = abs(expected_ts - api_ts) < 1e-12 if expected_ts > 0 else True
+
+        if cs_ok and ts_ok:
+            report["ok"].append(sym)
+        else:
+            report["mismatch"].append({
+                "symbol": sym, "id": pid,
+                "contract_size": (expected_cs, api_cs, cs_ok),
+                "tick_size": (expected_ts, api_ts, ts_ok),
+            })
+            logger.warning(
+                "PRODUCT_MAP MISMATCH %s [%s id=%d]: contract_size local=%.6f api=%.6f ok=%s | tick_size local=%g api=%g ok=%s",
+                sym, mode, pid, expected_cs, api_cs, cs_ok, expected_ts, api_ts, ts_ok,
+            )
+
+    logger.warning(
+        "PRODUCT_MAP validator [%s]: ok=%d mismatch=%d missing=%d",
+        mode, len(report["ok"]), len(report["mismatch"]), len(report["missing"]),
+    )
+    return report
 
 
 class DeltaClient:
@@ -194,12 +312,45 @@ class DeltaClient:
     MIN_ORDER_DELAY_MS = 400  # Minimum ms between orders on same symbol
     CANCEL_RATE_ALERT_PCT = 15  # Alert if cancel rate > 15%
 
-    def __init__(self, mode: str = "demo"):
+    def __init__(
+        self,
+        mode: str = "demo",
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        base_url: Optional[str] = None,
+        owner: Optional[str] = None,
+    ):
         """
         Args:
             mode: "demo" for testnet, "live" for production
+            api_key: explicit API key (preferred — multi-user per-user path).
+                When provided, connect() uses it directly and does NOT read .env.
+            api_secret: explicit API secret. Required if api_key is provided.
+            base_url: explicit base URL. Defaults are inferred from mode.
+            owner: who this client represents. One of:
+                - user_id (UUID string) for per-user clients
+                - "system" for the legacy shared-account path (ONLY valid when
+                  explicit keys are omitted and .env has DELTA_API_KEY set —
+                  otherwise connect() refuses to start)
+                - None is NOT allowed when keys aren't explicit (fail-fast)
+
+        SEC FIX (2026-04-19):
+            Previously this class silently fell back to the global .env
+            DELTA_API_KEY/DELTA_API_SECRET any time it was instantiated
+            without explicit keys. That meant the multi-user system's
+            legacy RealTradingManager was executing ALL users' trades
+            under one hardcoded account, corrupting audit trails.
+
+            Now callers MUST opt into the legacy path explicitly by passing
+            owner="system", AND they get a loud warning on every connect().
+            Per-user callers (UserRealRegistry) pass their own keys and
+            never touch .env.
         """
         self.mode = mode
+        self._explicit_api_key = api_key
+        self._explicit_api_secret = api_secret
+        self._explicit_base_url = base_url
+        self._owner = owner or "unspecified"
         self._client = None
         self._connected = False
         self._balance_cache: Optional[float] = None
@@ -221,22 +372,62 @@ class DeltaClient:
         self._api_errors: List[float] = []  # timestamps of API errors
 
     def connect(self) -> bool:
-        """Initialize the Delta REST client."""
+        """Initialize the Delta REST client.
+
+        Credential resolution order:
+          1. Explicit keys passed to __init__ (multi-user per-user path)
+          2. If owner="system": fall back to .env (LEGACY, single-shared-account,
+             emits WARNING on every call). Any other owner value rejects the fallback.
+        """
         try:
             from delta_rest_client import DeltaRestClient, OrderType
             self._OrderType = OrderType  # store for use in other methods
 
-            if self.mode == "demo":
-                api_key = os.getenv("DELTA_DEMO_API_KEY", "")
-                api_secret = os.getenv("DELTA_DEMO_API_SECRET", "")
-                base_url = os.getenv("DELTA_DEMO_BASE_URL", "https://cdn-ind.testnet.deltaex.org")
+            api_key = self._explicit_api_key or ""
+            api_secret = self._explicit_api_secret or ""
+            base_url = self._explicit_base_url or ""
+
+            # Path A: explicit keys
+            if api_key and api_secret:
+                if not base_url:
+                    base_url = ("https://cdn-ind.testnet.deltaex.org"
+                                if self.mode == "demo"
+                                else "https://api.india.delta.exchange")
+                logger.info("DELTA [%s]: connecting with explicit keys (owner=%s)",
+                            self.mode.upper(), str(self._owner)[:12])
+
+            # Path B: legacy shared-account fallback (explicit opt-in via owner="system")
+            elif self._owner == "system":
+                if self.mode == "demo":
+                    api_key = os.getenv("DELTA_DEMO_API_KEY", "")
+                    api_secret = os.getenv("DELTA_DEMO_API_SECRET", "")
+                    base_url = os.getenv("DELTA_DEMO_BASE_URL",
+                                         "https://cdn-ind.testnet.deltaex.org")
+                else:
+                    api_key = os.getenv("DELTA_API_KEY", "")
+                    api_secret = os.getenv("DELTA_API_SECRET", "")
+                    base_url = "https://api.india.delta.exchange"
+                if api_key or api_secret:
+                    logger.warning(
+                        "DELTA [%s]: using LEGACY shared-account .env keys (owner=system). "
+                        "This is deprecated — migrate to UserRealRegistry for multi-user.",
+                        self.mode.upper(),
+                    )
+
+            # Path C: refuse — no keys, not opted into legacy
             else:
-                api_key = os.getenv("DELTA_API_KEY", "")
-                api_secret = os.getenv("DELTA_API_SECRET", "")
-                base_url = "https://api.india.delta.exchange"
+                logger.error(
+                    "DELTA [%s]: refusing to connect — no explicit keys passed and "
+                    "owner=%s is not 'system'. Callers must pass api_key/api_secret.",
+                    self.mode.upper(), self._owner,
+                )
+                return False
 
             if not api_key or not api_secret:
-                logger.error("DELTA: No API credentials for %s mode", self.mode)
+                logger.error(
+                    "DELTA [%s]: no credentials resolved (owner=%s) — connect aborted",
+                    self.mode.upper(), self._owner,
+                )
                 return False
 
             self._client = DeltaRestClient(
@@ -525,6 +716,85 @@ class DeltaClient:
         except Exception as e:
             self._track_api_error()
             logger.error("DELTA [%s] SL FAILED: %s | %s", self.mode.upper(), symbol, e)
+            return {"error": str(e)}
+
+    def edit_order(
+        self,
+        order_id: int,
+        product_id: int,
+        stop_price: Optional[float] = None,
+        limit_price: Optional[float] = None,
+        size: Optional[int] = None,
+        trail_amount: Optional[float] = None,
+        post_only: Optional[bool] = None,
+        client_order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Edit an existing order in place via PUT /v2/orders.
+
+        Phase 5.9-B (2026-04-24) — REPLACES cancel-then-create for SL trail.
+
+        Why this matters:
+          Our 5.3.5→5.3.8 patch stack exists because cancel+create has a
+          race window (order rejected → position unprotected) AND doubles
+          API weight (10 vs 5 per trail update). Delta natively supports
+          editing stop_price in place — atomic, no race, half the weight.
+
+        Editable fields (per Delta docs):
+          limit_price, size, stop_price, trail_amount, post_only, mmp
+
+        Required fields in payload: id, product_id.
+
+        Returns Delta order dict on success, {"error": ...} on failure.
+        Callers should fall back to cancel+create if this returns error
+        (e.g. order already filled or cancelled).
+        """
+        self._rate_limit_check()
+        payload: Dict[str, Any] = {
+            "id": int(order_id),
+            "product_id": int(product_id),
+        }
+        if stop_price is not None:
+            payload["stop_price"] = str(stop_price)
+        if limit_price is not None:
+            payload["limit_price"] = str(limit_price)
+        if size is not None:
+            payload["size"] = int(size)
+        if trail_amount is not None:
+            payload["trail_amount"] = str(trail_amount)
+        if post_only is not None:
+            payload["post_only"] = "true" if post_only else "false"
+        if client_order_id is not None:
+            payload["client_order_id"] = client_order_id[:32]
+
+        try:
+            result = self._client.request("PUT", "/v2/orders", payload=payload, auth=True)
+            if hasattr(result, 'json'):
+                result = result.json().get("result", result.json())
+            elif not isinstance(result, dict):
+                result = {"raw": str(result)}
+            # On success Delta echoes back the full order dict with updated fields.
+            # On error it returns {"success": false, "error": {"code": ...}}.
+            if isinstance(result, dict) and result.get("success") is False:
+                # Treat explicit error response as failure for caller dispatch.
+                err = result.get("error", {}) or {}
+                _code = err.get("code", "unknown") if isinstance(err, dict) else str(err)
+                logger.warning(
+                    "DELTA [%s] EDIT REJECTED: order_id=%s stop=%s code=%s",
+                    self.mode.upper(), order_id, stop_price, _code,
+                )
+                return {"error": _code, "raw": result}
+            logger.info(
+                "DELTA [%s] EDIT OK: order_id=%s stop_price=%s",
+                self.mode.upper(), order_id, stop_price,
+            )
+            return result if isinstance(result, dict) else {"raw": result}
+
+        except Exception as e:
+            self._track_api_error()
+            logger.warning(
+                "DELTA [%s] EDIT FAILED: order_id=%s | %s",
+                self.mode.upper(), order_id, e,
+            )
             return {"error": str(e)}
 
     def place_take_profit(

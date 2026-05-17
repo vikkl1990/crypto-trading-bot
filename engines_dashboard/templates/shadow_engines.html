@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Shadow Engines{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>SHADOW ENGINES — execution_v2</h1>
+  <p class="subtitle">Fill-aware paper engines. Verdict per spec section 10. Last sync: {{ last_sync }}.</p>
+</header>
+
+{% if not engines %}
+<div class="empty-state">
+  <p>No execution_v2 engines detected yet.</p>
+  <p class="muted">Engines using <code>execution_v2/trade_logger.py</code> auto-appear here once they write <code>candidates.jsonl</code> + <code>trades.jsonl</code>.</p>
+</div>
+{% else %}
+<table class="data-table shadow-engines-table">
+  <thead>
+    <tr>
+      <th>ENGINE</th>
+      <th>VERDICT</th>
+      <th>CANDIDATES</th>
+      <th>FILLED</th>
+      <th>FILL%</th>
+      <th>EV REJ</th>
+      <th>TRADES</th>
+      <th>WIN%</th>
+      <th>NET $</th>
+      <th>FEES $</th>
+      <th>EV/TRADE</th>
+      <th>MAKER%</th>
+      <th>AVG TTF</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for e in engines %}
+    <tr class="verdict-{{ e.verdict|lower }}">
+      <td><strong>{{ e.name }}</strong></td>
+      <td><span class="badge badge-{{ e.verdict|lower }}">{{ e.verdict }}</span></td>
+      <td>{{ e.candidates_seen }}</td>
+      <td>{{ e.filled }}/{{ e.submitted }}</td>
+      <td>{{ '%.0f' % (e.fill_rate * 100) }}%</td>
+      <td>{{ e.ev_rejected }}</td>
+      <td>{{ e.closed_trades }}</td>
+      <td>{{ '%.0f' % (e.win_rate * 100) }}%</td>
+      <td class="{{ 'pos' if e.net_pnl_usd > 0 else 'neg' }}">${{ '%+.2f' % e.net_pnl_usd }}</td>
+      <td>${{ '%.2f' % e.fees_usd_total }}</td>
+      <td class="{{ 'pos' if e.ev_per_trade > 0 else 'neg' }}">${{ '%+.3f' % e.ev_per_trade }}</td>
+      <td>{{ '%.0f' % (e.maker_pct * 100) }}%</td>
+      <td>{{ '%.0f' % e.avg_time_to_fill_sec }}s</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<section class="legend">
+  <h3>Verdict gates (spec section 10)</h3>
+  <ul>
+    <li><span class="badge badge-pass">PASS</span> n≥50 trades, EV/trade > +$0.10, maker% > 40, no single trade dominates</li>
+    <li><span class="badge badge-hold">HOLD</span> n&lt;50 OR EV unstable OR result from a single symbol only</li>
+    <li><span class="badge badge-kill">KILL</span> n≥30 with negative EV, OR maker% &lt; 20%, OR timeout exits > 60%</li>
+  </ul>
+</section>
+{% endif %}
+{% endblock %}

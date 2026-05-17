@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Engines Dashboard{% endblock %} · VN Edge Shadow Live</title>
+  {% if auto_refresh %}<meta http-equiv="refresh" content="60">{% endif %}
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-logo">VN</div>
+      <div>
+        <div class="brand-name">Engines Dashboard</div>
+        <div class="brand-sub">Shadow Live · VM2 · Read-only</div>
+      </div>
+    </div>
+    <nav class="nav-links">
+      <a href="{{ url_for('overview') }}" class="{% if request.endpoint == 'overview' %}active{% endif %}">Overview</a>
+      <a href="{{ url_for('backtest_browser') }}" class="{% if request.endpoint and request.endpoint.startswith('backtest') %}active{% endif %}">Backtests</a>
+    </nav>
+    <div class="sync-stamp">
+      <span class="sync-dot"></span>
+      Synced: {{ last_sync }}
+    </div>
+  </header>
+
+  <main>
+    {% block content %}{% endblock %}
+    <div class="footer-tag">
+      VN Edge · Engines Shadow Live · VM2 158.101.112.94:8083 · Read-only mirror of VM1 storage/
+    </div>
+  </main>
+</body>
+</html>

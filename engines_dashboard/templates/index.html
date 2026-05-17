@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% set auto_refresh = True %}
+{% block title %}Engine Overview{% endblock %}
+
+{% block content %}
+<h1>Engine Shadow-Live Overview</h1>
+<p class="subtitle">4 paper engines running on VM1, mirrored read-only to VM2 every 60s. Auto-refresh: 60s.</p>
+
+<div class="cards-grid">
+  {% for e in engines %}
+  {% set bt = e.cfg.backtest %}
+  <a href="{{ url_for('engine_detail', name=e.key) }}" class="card color-{{ e.cfg.color }}">
+    <div class="card-head">
+      <div>
+        <div class="card-title">{{ e.cfg.name }}</div>
+        <div class="card-subtitle">{{ e.cfg.full_name }}</div>
+      </div>
+      {% if bt.wf_status == 'PASSED' %}
+        <span class="badge success">W/F PASSED</span>
+      {% elif bt.wf_status == 'FAIL' %}
+        <span class="badge danger">W/F FAIL</span>
+      {% else %}
+        <span class="badge dim">NO W/F</span>
+      {% endif %}
+    </div>
+
+    <div class="card-desc">{{ e.cfg.desc }}</div>
+
+    <div class="bt-baseline">
+      <div class="label-line">Backtest baseline</div>
+      <strong>n={{ bt.n }}</strong> · <strong>{{ '{:.1f}'.format(bt.wr * 100) }}% WR</strong> · <strong>EV ${{ '{:+.2f}'.format(bt.ev_per_trade) }}/trade</strong> · net ${{ '{:+.2f}'.format(bt.net) }}
+    </div>
+
+    <h3 style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.7px; color: var(--text-tertiary); margin-top: 8px; margin-bottom: 6px;">Forward (paper)</h3>
+    <div class="stat-row four">
+      <div class="stat">
+        <div class="stat-label">Closed</div>
+        <div class="stat-value">{{ e.stats.n_closed }}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Wins</div>
+        <div class="stat-value">{{ e.stats.wins }}{% if e.stats.n_closed %} <span style="font-size:10px;color:var(--text-tertiary);">({{ '{:.0f}'.format(e.stats.wr * 100) }}%)</span>{% endif %}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Net P&amp;L</div>
+        <div class="stat-value {% if e.stats.net_pnl > 0 %}success{% elif e.stats.net_pnl < 0 %}danger{% else %}muted{% endif %}">
+          ${{ '{:+.2f}'.format(e.stats.net_pnl) }}
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Open</div>
+        <div class="stat-value {% if e.n_open %}warning{% else %}muted{% endif %}">{{ e.n_open }}</div>
+      </div>
+    </div>
+
+    <div class="gap-line">
+      {% if e.days_running %}Running <strong style="color:var(--text-primary);">{{ '{:.1f}'.format(e.days_running) }} days</strong> ·{% endif %}
+      {% if e.fwd_vs_bt_pct is not none %}
+        EV vs backtest:
+        <span class="pct {% if e.fwd_vs_bt_pct >= 80 %}over{% elif e.fwd_vs_bt_pct >= 0 %}under{% else %}bad{% endif %}">
+          {{ '{:.0f}'.format(e.fwd_vs_bt_pct) }}% of expected
+        </span>
+        (fwd ${{ '{:+.2f}'.format(e.stats.avg_per_trade) }} / bt ${{ '{:+.2f}'.format(bt.ev_per_trade) }})
+      {% else %}
+        <span style="color: var(--text-tertiary);">No forward closes yet — waiting for first signal.</span>
+      {% endif %}
+    </div>
+  </a>
+  {% endfor %}
+</div>
+
+<h2>Queued / Dark Code</h2>
+<div class="cards-grid">
+  {% for q in queued %}
+  <div class="card color-purple">
+    <div class="card-head">
+      <div>
+        <div class="card-title" style="font-size:14px;">{{ q.name }}</div>
+      </div>
+      {% if q.status == 'WF_PASSED_DARK' %}
+        <span class="badge success">W/F PASSED · DARK</span>
+      {% elif q.status == 'HOLD_DARK' %}
+        <span class="badge warning">HOLD · DARK</span>
+      {% elif q.status == 'PENDING_WF' %}
+        <span class="badge neutral">PENDING W/F</span>
+      {% else %}
+        <span class="badge dim">{{ q.status }}</span>
+      {% endif %}
+    </div>
+    <div class="card-desc">{{ q.desc }}</div>
+    <a href="{{ url_for('backtest_browser') }}#{{ q.report_dir }}" style="font-size:11px;">View report →</a>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

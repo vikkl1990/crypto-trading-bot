@@ -1,39 +1,96 @@
-# Secrets - NEVER commit
+# Environment
 .env
-*.pem
-*.key
-
-# Python
+.venv/
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
-venv/
-.venv/
 
-# Data & logs
+# Storage (runtime data)
+storage/
 logs/
-data/state/
-data/journal/
-*.db
+*.log
 
-# OS
-.DS_Store
-Thumbs.db
+# Temp fix scripts (root level only)
+/fix_*.py
+/unified_exit_system.py
+/parallel_real_exit.py
+/remaining_fixes.py
+/fix_indent.py
+/fix_critical_audit.py
 
 # IDE
-.vscode/
-.idea/
-
-# Deployment state
-deploy/.last_deployment.json
-
-# Claude Code
+.DS_Store
 .claude/
 
-# Large data files
-storage/
+# Backups
+*.bak*
+
+# Old root-level copies (real files are in subdirs)
+/nohup_bot.out
+/bot_out.log
+/ml_training.log
+/index.html
+/scalp_strategy.py
+/scalp_strategy.py.bak*
+/signal_tracker.py
+/signal_tracker.py.bak*
+/real_manager.py
+/delta_client.py
+/regime_filter.py
+/server.py
+/settings.yaml
+/trade_monitor.py
+
+# PID
+.bot.pid
+
+# VM operational (not tracked in GitHub)
 data/candles/
+data/state/
 backtest/results/
+storage/backups/
+storage/candle_cache/
+backups_phase4/
+nohup_bot.out
+*.bak
+.bot.pid
+.env
+.DS_Store
+.git.orphan.bak/
+add_*.py
+fix_*.py
+debug_*.py
+delta_*.py
+*_audit.py
+*_review.py
+analyze_v2.py
+collect_and_backtest.py
+deep_dive_capital.py
+degrade_analysis.py
+diag_prefilter.py
+feedback_audit.py
+find_crash.py
+full_real_audit.py
+gap_check.py
+hybrid_trail.py
+impact_analysis.py
+latency_arb.py
+paper_losses_today.py
+parallel_real_exit.py
+perf_review.py
+production_fixes.py
+remaining_fixes.py
+safety_fixes.py
+scanner_review.py
+stabilize.py
+today_review.py
+trail_confidence.py
+unified_exit_system.py
+
+# === Hardened 2026-05-17 (OCI snapshot push to legacy branch) ===
+# Catch all .env variants including .env.sed_bak (which the *.bak* rule misses)
+.env*
+*.sed_bak
+
+# Operational backup dirs — code-history backups, not canonical source
+.rollback/
+.archive/

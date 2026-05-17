@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+{% block title %}{{ view.cfg.name }} · Detail{% endblock %}
+
+{% block content %}
+<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-bottom:6px;">
+  <div>
+    <h1>{{ view.cfg.name }} <span style="color:var(--text-tertiary);font-weight:400;font-size:14px;">— {{ view.cfg.full_name }}</span></h1>
+    <p class="subtitle">{{ view.cfg.desc }} · tag <code style="color:var(--accent);">{{ view.cfg.tag }}</code></p>
+  </div>
+  <div style="display:flex;gap:6px;">
+    {% if view.cfg.backtest.wf_status == 'PASSED' %}
+      <span class="badge success">W/F PASSED</span>
+    {% else %}
+      <span class="badge dim">NO W/F</span>
+    {% endif %}
+    {% if view.n_open %}<span class="badge warning">{{ view.n_open }} open</span>{% endif %}
+  </div>
+</div>
+
+<a href="{{ url_for('overview') }}" style="font-size: 11px; color: var(--text-tertiary);">← back to overview</a>
+
+<div class="section">
+  <div class="stat-row four">
+    <div class="stat">
+      <div class="stat-label">Closed Trades</div>
+      <div class="stat-value lg">{{ view.stats.n_closed }}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Wins / WR</div>
+      <div class="stat-value lg">{{ view.stats.wins }} <span style="color:var(--text-tertiary);font-size:11px;">({{ '{:.0f}'.format(view.stats.wr * 100) }}%)</span></div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Net P&amp;L</div>
+      <div class="stat-value lg {% if view.stats.net_pnl > 0 %}success{% elif view.stats.net_pnl < 0 %}danger{% else %}muted{% endif %}">${{ '{:+.2f}'.format(view.stats.net_pnl) }}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Avg / Trade</div>
+      <div class="stat-value lg {% if view.stats.avg_per_trade > 0 %}success{% elif view.stats.avg_per_trade < 0 %}danger{% else %}muted{% endif %}">${{ '{:+.2f}'.format(view.stats.avg_per_trade) }}</div>
+    </div>
+  </div>
+
+  <div class="bt-baseline">
+    <div class="label-line">Backtest baseline reference</div>
+    {{ view.cfg.backtest.summary }}
+  </div>
+
+  {% if view.fwd_vs_bt_pct is not none %}
+  <div class="panel" style="margin-top:8px;">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.7px;color:var(--text-tertiary);margin-bottom:4px;">Forward vs Backtest gap</div>
+    <div style="font-size: 14px; line-height: 1.55;">
+      Forward EV/trade = <strong style="color:var(--text-primary);">${{ '{:+.2f}'.format(view.stats.avg_per_trade) }}</strong>
+      vs backtest <strong style="color:var(--text-primary);">${{ '{:+.2f}'.format(view.cfg.backtest.ev_per_trade) }}</strong> →
+      <span class="pct {% if view.fwd_vs_bt_pct >= 80 %}over{% elif view.fwd_vs_bt_pct >= 0 %}under{% else %}bad{% endif %}" style="font-weight:700;">
+        {{ '{:.1f}'.format(view.fwd_vs_bt_pct) }}% of expected
+      </span>
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+{% if view.cfg.backtest.wf_detail %}
+<h2>Walk-forward Quarters</h2>
+<div class="chart-wrap">
+  <canvas id="wfChart"></canvas>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+const wfDetail = {{ view.cfg.backtest.wf_detail | tojson }};
+const labels = Object.keys(wfDetail);
+const evs = labels.map(k => wfDetail[k].ev);
+const ns = labels.map(k => wfDetail[k].n);
+new Chart(document.getElementById('wfChart').getContext('2d'), {
+  type: 'bar',
+  data: {
+    labels: labels,
+    datasets: [{
+      label: 'EV / trade ($)',
+      data: evs,
+      backgroundColor: evs.map(v => v > 0 ? 'rgba(34,197,94,0.7)' : 'rgba(239,68,68,0.7)'),
+      borderColor:     evs.map(v => v > 0 ? '#22c55e' : '#ef4444'),
+      borderWidth: 1,
+      borderRadius: 4,
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { labels: { color: '#9ca8be', font: { family: 'ui-monospace, monospace', size: 11 } } },
+      tooltip: {
+        callbacks: {
+          afterLabel: (ctx) => `n = ${ns[ctx.dataIndex]}`
+        }
+      }
+    },
+    scales: {
+      x: { ticks: { color: '#9ca8be', font: { family: 'ui-monospace, monospace', size: 11 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+      y: { ticks: { color: '#9ca8be', font: { family: 'ui-monospace, monospace', size: 11 }, callback: v => '$' + v }, grid: { color: 'rgba(255,255,255,0.05)' } }
+    }
+  }
+});
+</script>
+{% endif %}
+
+<h2>Open Positions</h2>
+<div class="panel">
+  {% if view.open_positions %}
+  <div class="scroll-wrap">
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Symbol</th><th>Side</th><th class="num">Entry</th><th class="num">SL</th><th>Opened</th><th class="num">Notional</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for t in view.open_positions %}
+      <tr>
+        <td>{{ t.get('symbol','—') }}</td>
+        <td>{{ t.get('side','—') }}</td>
+        <td class="num">{{ t.get('entry','—') }}</td>
+        <td class="num">{{ '{:.4f}'.format(t.get('sl', 0)) if t.get('sl') is not none else '—' }}</td>
+        <td>{{ (t.get('opened_at') or '')[:19] }}</td>
+        <td class="num">${{ '{:.0f}'.format(t.get('notional', 0)) }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <div class="open-list"><span class="empty">No open positions.</span></div>
+  {% endif %}
+</div>
+
+<h2>Trade History (last 50)</h2>
+{% if view.last50 %}
+<div class="scroll-wrap">
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Opened</th><th>Symbol</th><th>Side</th>
+      <th class="num">Entry</th><th class="num">Exit</th>
+      <th>Exit reason</th>
+      <th class="num">Net P&amp;L</th><th class="num">Fees</th>
+      <th class="num">Peak MFE (R)</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for t in view.last50 %}
+    {% set pnl = t.get('net_pnl_usd') %}
+    <tr>
+      <td>{{ (t.get('opened_at') or '')[:19] }}</td>
+      <td>{{ t.get('symbol','—') }}</td>
+      <td>{{ t.get('side','—') }}</td>
+      <td class="num">{{ t.get('entry','—') }}</td>
+      <td class="num">{{ t.get('exit_price','—') }}</td>
+      <td>{{ t.get('exit_reason','—') }}</td>
+      <td class="num {% if pnl is not none and pnl > 0 %}pos{% elif pnl is not none and pnl < 0 %}neg{% endif %}">
+        {% if pnl is not none %}${{ '{:+.2f}'.format(pnl) }}{% else %}—{% endif %}
+      </td>
+      <td class="num">${{ '{:.2f}'.format(t.get('fees_usd', 0)) }}</td>
+      <td class="num">{{ '{:.2f}'.format(t.get('peak_mfe_r', 0)) if t.get('peak_mfe_r') is not none else '—' }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<div class="empty-state">No closed trades yet for {{ view.cfg.name }}.</div>
+{% endif %}
+
+<h2>State.json (raw)</h2>
+<pre class="code-block">{{ view.state | tojson(indent=2) }}</pre>
+
+{% if view.latest_md_html %}
+<h2>latest.md</h2>
+<div class="panel md-body">{{ view.latest_md_html | safe }}</div>
+{% endif %}
+
+{% endblock %}

@@ -121,7 +121,7 @@ def setup_logger(
 
     log = logging.getLogger(name)
     log.setLevel(level)
-    log.propagate = False  # prevent duplicate output on root logger
+    log.propagate = True  # allow logs to reach root handler (stdout)  # prevent duplicate output on root logger
 
     # ---- Console handler ----
     if console_enabled and not _has_handler(log, logging.StreamHandler):

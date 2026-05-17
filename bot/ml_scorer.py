@@ -9,6 +9,7 @@ Architecture:
 """
 
 import logging
+import os
 import time
 from typing import Dict, Optional
 
@@ -109,10 +110,17 @@ class MLScorer:
                 _payload["symbol"] = symbol
             if side:
                 _payload["side"] = side
+            # PATCH_G_5_22 (2026-05-02) — send X-API-Key header from env so the
+            # auth middleware on the ML dashboard accepts our POST. Empty key
+            # = empty header (dashboard treats missing key as legacy mode and
+            # will reject — must be configured before dashboard enforces).
+            _ml_api_key = os.environ.get("ML_DASHBOARD_API_KEY", "")
+            _ml_headers = {"X-API-Key": _ml_api_key} if _ml_api_key else None
             resp = requests.post(
                 self._url,
                 json=_payload,
                 timeout=SCORE_TIMEOUT,
+                headers=_ml_headers,
             )
             latency_ms = (time.time() - t0) * 1000
             self._stats["avg_latency_ms"] = (

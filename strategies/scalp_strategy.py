@@ -30,6 +30,7 @@ Risk Profile (per trade)
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -73,6 +74,21 @@ from strategies.regime_filter import (
     detect_regime_transition,
 )
 from bot.ev_engine import EVEngine
+# PATCH_JK_5_22 (2026-05-02) — circuit breaker + ATR regime gate
+# DEADLOCK_FIX_5_22 (2026-05-02 18:00 UTC) — Patch JK circuit breaker has
+# a logical deadlock: lazy-seed from DB sees today's bad 15% WR, trips for
+# 60min, after expiry re-checks SAME window (no new closes because blocked),
+# trips again → permanent SB lockout. Disabled by setting trackers to None.
+# The try/except wrapper at each call site makes is_blocked() a no-op.
+# Re-enable: uncomment the imports below after fixing lazy-seed logic.
+# try:
+#     from bot.circuit_breaker import get_tracker as _patch_jk_get_tracker
+#     from bot.regime_gate import get_regime_gate as _patch_jk_get_regime_gate
+# except Exception:
+#     _patch_jk_get_tracker = None
+#     _patch_jk_get_regime_gate = None
+_patch_jk_get_tracker = None
+_patch_jk_get_regime_gate = None
 from bot.feature_logger import FeatureLogger
 from bot.ml_scorer import MLScorer, build_scoring_features
 from bot.mode_manager import get_mode_manager
@@ -189,15 +205,21 @@ class ScalpStrategy(BaseStrategy):
     # Overrides the hard ML veto gate on a per-pair basis.
     # Well-calibrated majors can use a slightly lower threshold;
     # less liquid / meme pairs need higher conviction.
+    # BATCH_F_5_22 (2026-05-02) — REVERTED ML thresholds back to original.
+    # The 2026-05-01 lowering (-0.05) admitted more marginal signals.
+    # In a chop regime (May 2: 56% WR vs 88% Apr 30), marginal admits
+    # turn into duds. Reverting back to original tighter values restores
+    # selectivity. Re-enable the lowering only if regime confirms calibration
+    # gap was real (would need 14d of fresh live_outcome model evidence).
     PAIR_ML_THRESHOLDS: Dict[str, float] = {
-        "BTC/USDT": 0.48,    # BTC models are well-calibrated, slightly lower threshold OK
-        "ETH/USDT": 0.48,    # Same for ETH
-        "SOL/USDT": 0.50,    # Default
-        "AVAX/USDT": 0.52,   # Less liquid, need higher confidence
-        "LINK/USDT": 0.52,   # Less liquid
-        "DOGE/USDT": 0.55,   # Meme coin, need high conviction
+        "BTC/USDT": 0.48,    # restored from 0.43
+        "ETH/USDT": 0.48,    # restored from 0.43
+        "SOL/USDT": 0.50,    # restored from 0.45
+        "AVAX/USDT": 0.52,   # restored from 0.47
+        "LINK/USDT": 0.52,   # restored from 0.47
+        "DOGE/USDT": 0.55,   # restored from 0.50
     }
-    DEFAULT_ML_THRESHOLD: float = 0.50
+    DEFAULT_ML_THRESHOLD: float = 0.50  # restored from 0.45
 
     def __init__(self, config: Dict[str, Any]) -> None:
         bot_cfg = config.get("bot", {})
@@ -381,6 +403,52 @@ class ScalpStrategy(BaseStrategy):
         self._regime_filter = RegimeFilter()
         self._last_regime_info: Dict[str, Dict[str, Any]] = {}  # symbol → regime info
 
+        # --- Research Center shadow adapter (2026-04-17) ---
+        # Reads storage/research/active_vetoes.json (written by ResearchCenter UI)
+        # and logs `would_veto` metadata on matching signals. SHADOW MODE only —
+        # never blocks trades. Enforcement flag flips in a separate commit after
+        # 7d of observation showing the vetoed cohorts are indeed losers.
+        # Reloaded from disk every N scans (60s mtime check) so UI changes
+        # take effect without bot restart.
+        self._research_vetoes: List[Dict[str, Any]] = []
+        self._research_vetoes_mtime: float = 0.0
+        self._research_vetoes_check_interval: int = 60  # seconds
+
+        # --- Research Center shadow promotion adapter (2026-04-17) ---
+        # Reads storage/research/active_promotions.json (written by ResearchCenter UI
+        # approve action) and attaches matching entries to prefilter context so
+        # downstream scanner scoring can log `research_would_boost` metadata.
+        # SHADOW MODE only — never changes trading behavior. Enforcement flag
+        # flips in a separate commit after 7d of observation showing the
+        # promoted cohorts sustain edge.
+        self._research_promotions: List[Dict[str, Any]] = []
+        self._research_promotions_mtime: float = 0.0
+
+        # --- Scanner attrition funnel sampling (Phase 1 of scanner research, 2026-04-17) ---
+        # Every ~60s per symbol, snapshot the full scanner-loop outcome
+        # (allowed_scanners, which triggered, which didn't and why) to
+        # storage/research/scanner_funnel.jsonl so the Research Center can
+        # build per-scanner attrition reports. Pure additive logging — zero
+        # effect on trading behavior. Append-only, best-effort, fail-silent.
+        self._funnel_last_emit: Dict[str, float] = {}       # symbol → epoch seconds
+        self._funnel_emit_interval_sec: float = 60.0
+
+        # --- Phase 4 of scanner research: Scanner Variant Adapter (2026-04-17) ---
+        # Reads storage/research/scanner_variants.json (approved by user via
+        # /research UI) and applies per-scanner behavior modifications:
+        #   - regime_whitelist: include scanner in more regimes (MODE_0 fix)
+        #   - filter_exemption: bypass specific downstream filters (MODE_2 fix)
+        #   - threshold_relax / lookback_widen: metadata only (scanner code
+        #     doesn't currently honor these — proposed for future per-scanner hooks)
+        #
+        # SHADOW MODE (default): logs `would_*` events, no behavior change.
+        # ENFORCE MODE (explicit per-scanner flip by user after 7d+30-events
+        # observation): actually modifies scanner gating.
+        #
+        # Read-only mtime poll, fail-silent, never blocks trading.
+        self._research_scanner_variants: List[Dict[str, Any]] = []
+        self._research_scanner_variants_mtime: float = 0.0
+
         # --- Regime transition tracking (per-symbol) ---
         self._prev_regime: Dict[str, str] = {}       # symbol → previous regime
         self._regime_age: Dict[str, int] = {}         # symbol → bars held in current regime
@@ -398,6 +466,19 @@ class ScalpStrategy(BaseStrategy):
         # real VM4 private IP 10.0.2.4:8081. settings.yaml can still override
         # via ml.scoring_url but the default must not be a stale VM.
         ml_cfg = config.get("ml", {})
+        # LIVE_OUTCOME_WIRING_5_22 (2026-05-02) — second ML model for measurement.
+        # Loads model_live_shared.joblib (PnL-trained, +7pp AUC vs candidate).
+        # Phase 1: log live_outcome_prob in metadata. No decision change.
+        # See docs/patch_live_outcome_wiring.md.
+        try:
+            from bot.live_outcome_scorer import LiveOutcomeScorer
+            self._live_outcome_scorer = LiveOutcomeScorer(enabled=True)
+            logger.warning("LiveOutcomeScorer initialized: %s",
+                           self._live_outcome_scorer.get_stats())
+        except Exception as _e:
+            logger.error("LiveOutcomeScorer init failed: %s", _e)
+            self._live_outcome_scorer = None
+
         self._ml_scorer = MLScorer(
             url=ml_cfg.get("scoring_url", "http://10.0.2.4:8081/api/score"),
             enabled=ml_cfg.get("enabled", True),
@@ -634,31 +715,63 @@ class ScalpStrategy(BaseStrategy):
             context["atr_regime"] = "normal"
 
         # ── (b) VWAP Hybrid Veto ──
-        # < 0.25 ATR = HARD BLOCK (true noise zone)
-        # 0.25-0.4 ATR = STRONG PENALTY (-20) (preserves early breakouts)
-        # > 0.4 ATR = clear
+        # Architecture V2 spec: abs(dist_from_vwap) < 0.3 ATR = noise zone → HARD VETO
+        # (except for vwap_mean_revert which WANTS to trade near VWAP)
+        # P5 (2026-04-16): SHADOW MODE — logs would_veto but doesn't block.
+        # After 7d observation, convert would_veto → hard block if vetoed trades have WR < 65%.
+        #
+        # Phase 4 (2026-04-17): filter_exemption variants can override this
+        # veto for approved scanners. Read from context["vwap_exempt_scanners"]
+        # set by downstream per-scanner emission. For now, the structural
+        # prefilter is symbol-level (before per-scanner scan), so exemption
+        # checks happen downstream when scanner result is evaluated.
+        #
+        # Layered thresholds:
+        #   < 0.12 ATR = deep noise     → confidence -25 + would_veto
+        #   0.12-0.30 ATR = noise zone  → confidence -20 + would_veto
+        #   0.30-0.40 ATR = marginal    → confidence -10 (no veto)
+        #   > 0.40 ATR = clear          → no adjustment
+        _VWAP_HARD_VETO_THRESHOLD = 0.30   # Architecture V2 spec
+        _VWAP_HARD_VETO_ENFORCE = False     # P5 SHADOW MODE — flip to True after validation
         try:
             last_close = float(df.iloc[-1].get("close", 0))
             last_vwap = float(df.iloc[-1].get("vwap", 0))
             _atr_for_vwap = confirm_atr if confirm_atr > 0 else float(df.iloc[-1].get("atr", 1))
             if last_vwap > 0 and _atr_for_vwap > 0:
                 vwap_dist = abs(last_close - last_vwap) / _atr_for_vwap
+                context["vwap_dist_atr"] = round(vwap_dist, 3)
+
                 if vwap_dist < 0.12:
-                    # Near-VWAP zone — soft penalty instead of hard block
-                    # vwap_mean_revert WANTS to trade here, so don't block entirely
+                    # Deep noise — very near VWAP
                     context["vwap_zone"] = "noise"
-                    context["vwap_dist_atr"] = round(vwap_dist, 3)
-                    confidence_adj -= 25  # heavy penalty but not a hard block
+                    confidence_adj -= 25
                     reasons.append(f"VWAP noise zone ({vwap_dist:.3f} ATR, -25)")
-                    # Note: vwap_mean_revert scanner handles its own VWAP logic
-                elif vwap_dist < 0.25:
+                elif vwap_dist < _VWAP_HARD_VETO_THRESHOLD:
+                    # V2 noise zone (< 0.30 ATR)
+                    context["vwap_zone"] = "penalty"
                     confidence_adj -= 20
                     reasons.append(f"VWAP penalty zone ({vwap_dist:.2f} ATR, -20)")
-                    context["vwap_zone"] = "penalty"
-                    context["vwap_dist_atr"] = round(vwap_dist, 3)
+                elif vwap_dist < 0.40:
+                    # Marginal zone — slight penalty
+                    context["vwap_zone"] = "marginal"
+                    confidence_adj -= 10
+                    reasons.append(f"VWAP marginal ({vwap_dist:.2f} ATR, -10)")
                 else:
                     context["vwap_zone"] = "clear"
-                    context["vwap_dist_atr"] = round(vwap_dist, 3)
+
+                # V2 HARD VETO: if price is within noise zone (<0.30 ATR from VWAP)
+                # In shadow mode: log would_veto. In enforced mode: hard block.
+                if vwap_dist < _VWAP_HARD_VETO_THRESHOLD:
+                    context["vwap_would_veto"] = True
+                    if _VWAP_HARD_VETO_ENFORCE:
+                        return {
+                            "pass": False,
+                            "confidence_adj": 0,
+                            "reason": f"VWAP HARD VETO: {vwap_dist:.3f} ATR < {_VWAP_HARD_VETO_THRESHOLD} (V2 spec)",
+                            "context": {**context, "vwap_zone": "vetoed"},
+                        }
+                else:
+                    context["vwap_would_veto"] = False
         except Exception:
             pass
 
@@ -720,6 +833,34 @@ class ScalpStrategy(BaseStrategy):
             if transition["in_transition"]:
                 reasons.append(f"regime transition ({transition['transition_type']})")
 
+        # ── Research Center shadow veto + promotion (2026-04-17) ──
+        # Check if the Research Center has flagged this (scanner, regime, side)
+        # as a frozen cohort OR approved a local promotion. We don't know
+        # `scanner`/`side` yet at prefilter time (that's per-scanner output),
+        # so we attach LOOKUP_TABLES to context and let downstream per-scanner
+        # code mark `research_would_veto=True` or `research_would_boost=True`
+        # on individual signals. Pure metadata, no blocking.
+        try:
+            self._refresh_research_vetoes()
+            self._refresh_research_promotions()
+            # Build a fast-lookup set of (regime, side) for any veto/promotion
+            # matching this regime, regardless of scanner — so the caller can
+            # quickly filter.
+            applicable_vetoes = [
+                v for v in self._research_vetoes
+                if v.get("regime") == regime
+            ]
+            if applicable_vetoes:
+                context["research_applicable_vetoes"] = applicable_vetoes
+            applicable_promotions = [
+                p for p in self._research_promotions
+                if p.get("regime") == regime
+            ]
+            if applicable_promotions:
+                context["research_applicable_promotions"] = applicable_promotions
+        except Exception:
+            pass  # never break prefilter on research-center read error
+
         return {
             "pass": True,
             "confidence_adj": confidence_adj,
@@ -727,6 +868,295 @@ class ScalpStrategy(BaseStrategy):
             "context": context,
             "regime_transition": transition,
         }
+
+    def _refresh_research_vetoes(self) -> None:
+        """Read storage/research/active_vetoes.json if mtime changed.
+
+        Called from prefilter — CHEAP (stat + optional json load).
+        Reloads at most every self._research_vetoes_check_interval seconds.
+        Read-only: never writes anything, never raises.
+        """
+        import os, json, time
+        try:
+            now = time.time()
+            last_check = getattr(self, "_research_vetoes_last_check", 0.0)
+            if now - last_check < self._research_vetoes_check_interval:
+                return
+            self._research_vetoes_last_check = now
+
+            path = Path(__file__).resolve().parent.parent / "storage" / "research" / "active_vetoes.json"
+            if not path.exists():
+                self._research_vetoes = []
+                return
+
+            mtime = path.stat().st_mtime
+            if mtime == self._research_vetoes_mtime:
+                return  # no change since last read
+
+            with open(path) as fh:
+                data = json.load(fh) or {}
+            self._research_vetoes = data.get("vetoes", []) if isinstance(data, dict) else []
+            self._research_vetoes_mtime = mtime
+        except Exception:
+            # Fail silent — research-center disk issues must never break trading
+            pass
+
+    def _refresh_research_promotions(self) -> None:
+        """Read storage/research/active_promotions.json if mtime changed.
+
+        Mirrors _refresh_research_vetoes. Loaded at most every
+        self._research_vetoes_check_interval seconds (shared throttle so
+        both files re-read on the same tick). Read-only, never raises.
+        """
+        import json
+        try:
+            path = Path(__file__).resolve().parent.parent / "storage" / "research" / "active_promotions.json"
+            if not path.exists():
+                self._research_promotions = []
+                return
+            mtime = path.stat().st_mtime
+            if mtime == self._research_promotions_mtime:
+                return
+            with open(path) as fh:
+                data = json.load(fh) or {}
+            self._research_promotions = data.get("promotions", []) if isinstance(data, dict) else []
+            self._research_promotions_mtime = mtime
+        except Exception:
+            pass
+
+    def _refresh_research_scanner_variants(self) -> None:
+        """Read storage/research/scanner_variants.json if mtime changed.
+        Mirrors _refresh_research_vetoes / _refresh_research_promotions.
+        Read-only, fail-silent, ~1 poll per minute via prefilter throttle."""
+        import json
+        try:
+            path = Path(__file__).resolve().parent.parent / "storage" / "research" / "scanner_variants.json"
+            if not path.exists():
+                self._research_scanner_variants = []
+                return
+            mtime = path.stat().st_mtime
+            if mtime == self._research_scanner_variants_mtime:
+                return
+            with open(path) as fh:
+                data = json.load(fh) or {}
+            self._research_scanner_variants = data.get("variants", []) if isinstance(data, dict) else []
+            self._research_scanner_variants_mtime = mtime
+        except Exception:
+            pass
+
+    def _get_scanner_variants_for(self, scanner_name: str, variant_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Return active variants matching scanner_name (and optionally type).
+        Safe: returns [] on any error or empty list."""
+        try:
+            vs = self._research_scanner_variants or []
+            out = []
+            for v in vs:
+                if v.get("scanner") != scanner_name:
+                    continue
+                if variant_type is not None:
+                    ptype = (v.get("proposal") or {}).get("type")
+                    if ptype != variant_type:
+                        continue
+                out.append(v)
+            return out
+        except Exception:
+            return []
+
+    def _emit_variant_event(self, kind: str, payload: Dict[str, Any]) -> None:
+        """Append a variant-related event (would_fire / would_exempt / enforced)
+        to the funnel log. Used for shadow-mode observation tracking by the
+        Research Center to determine when a variant is ready to enforce.
+
+        Rate-limited implicitly by the caller (only fires on actual scanner
+        events). Atomic single-write append, fail-silent.
+        """
+        import json as _json
+        try:
+            path = Path(__file__).resolve().parent.parent / "storage" / "research" / "scanner_funnel.jsonl"
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "kind": kind,
+                **payload,
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as fh:
+                fh.write(_json.dumps(record, default=str) + "\n")
+        except Exception:
+            pass
+
+    def _apply_regime_whitelist_variants(
+        self,
+        regime: str,
+        symbol: str,
+        current_allowed: List[Any],
+        scanner_method_map: Dict[str, Any],
+    ) -> List[Any]:
+        """Phase-4 activation hook: consult approved `regime_whitelist` variants
+        to potentially expand the allowed_scanners list for this regime.
+
+        Shadow mode: logs `variant_would_add_scanner` events, returns current_allowed unchanged.
+        Enforce mode: returns current_allowed PLUS the whitelisted scanner methods.
+
+        Bounded by the scanner_method_map — if variant requests a scanner not
+        in the map (old/renamed/unknown), it's silently skipped.
+
+        Additionally: emits shadow events for filter_exemption variants (for
+        observation tracking only — enforcement of filter bypass is deferred
+        to a separate commit once observation validates). This gives the
+        Research Center readiness data without any hot-path risk.
+        """
+        try:
+            variants = self._research_scanner_variants or []
+            if not variants:
+                return current_allowed
+            out = list(current_allowed)
+            already_names = {s.__name__.replace("_scan_", "") for s in out}
+            for v in variants:
+                proposal = v.get("proposal") or {}
+                ptype = proposal.get("type")
+                scn_name = v.get("scanner")
+                if not scn_name:
+                    continue
+                mode = v.get("mode") or "shadow"
+
+                # --- regime_whitelist: add scanner to allowed list ---
+                if ptype == "regime_whitelist":
+                    target_regimes = proposal.get("target_regimes") or []
+                    if regime not in target_regimes:
+                        continue
+                    if scn_name in already_names:
+                        continue
+                    scanner_fn = scanner_method_map.get(scn_name)
+                    if scanner_fn is None:
+                        continue
+                    if mode == "enforce":
+                        out.append(scanner_fn)
+                        already_names.add(scn_name)
+                        self._emit_variant_event("variant_enforced", {
+                            "variant_type": "regime_whitelist",
+                            "scanner": scn_name,
+                            "symbol": symbol,
+                            "regime": regime,
+                            "action": "added_to_allowed",
+                        })
+                    else:
+                        # Shadow: log what we WOULD do
+                        self._emit_variant_event("variant_would_fire", {
+                            "variant_type": "regime_whitelist",
+                            "scanner": scn_name,
+                            "symbol": symbol,
+                            "regime": regime,
+                            "mode": "shadow",
+                            "would_add": True,
+                        })
+
+                # --- filter_exemption: shadow-only observation this commit ---
+                elif ptype == "filter_exemption":
+                    # Log observation events whenever this scanner IS being
+                    # run in this regime — independent of whether it actually
+                    # triggers. Observation = "this opportunity exists."
+                    # Actual filter bypass deferred to follow-up after
+                    # shadow_observation validates the variant.
+                    if scn_name in already_names:
+                        self._emit_variant_event("variant_observed", {
+                            "variant_type": "filter_exemption",
+                            "scanner": scn_name,
+                            "symbol": symbol,
+                            "regime": regime,
+                            "mode": mode,
+                            "exempt_candidates": proposal.get("exempt_candidates", []),
+                        })
+
+                # --- threshold_relax / lookback_widen / generic_relax ---
+                elif ptype in ("threshold_relax", "lookback_widen", "generic_relax"):
+                    # Metadata-only for now: scanner code doesn't yet honor
+                    # these runtime parameter overrides. Observation event is
+                    # emitted so the Research Lab can track how often the
+                    # scanner was attempted and still failed — informing
+                    # whether tuning this specific scanner is worth building
+                    # a dedicated code hook for.
+                    if scn_name in already_names:
+                        self._emit_variant_event("variant_observed", {
+                            "variant_type": ptype,
+                            "scanner": scn_name,
+                            "symbol": symbol,
+                            "regime": regime,
+                            "mode": mode,
+                        })
+            return out
+        except Exception:
+            # Never break allowed_scanners computation on variant-logic error
+            return current_allowed
+
+    def _emit_funnel_sample(
+        self,
+        symbol: str,
+        regime: str,
+        atr_ratio: float,
+        allowed_scanners: List[Any],
+        scan_results: List[Any],
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Append a compact snapshot of scanner-loop outcome to
+        storage/research/scanner_funnel.jsonl. Rate-limited per-symbol to
+        self._funnel_emit_interval_sec (default 60s) so the file stays
+        manageable (~1 line per symbol per minute = ~1.5 MB/day for 16 symbols).
+
+        Wrapped broadly in try/except — funnel logging must NEVER interrupt
+        the trading hot-path. Atomic append via single write() call.
+        """
+        import json as _json, time as _time
+        try:
+            now = _time.time()
+            last = self._funnel_last_emit.get(symbol, 0.0)
+            if now - last < self._funnel_emit_interval_sec:
+                return
+            self._funnel_last_emit[symbol] = now
+
+            # Build compact result list
+            results = []
+            for sr in scan_results:
+                if sr.setup_result is not None:
+                    results.append({
+                        "scanner": sr.scanner_name,
+                        "triggered": True,
+                        "score": round(sr.weighted_score, 1),
+                        "side": sr.side.value if sr.side else None,
+                        "status": sr.scanner_status,
+                        "weight": round(sr.scanner_weight, 2),
+                    })
+                else:
+                    reason = ""
+                    if sr.penalties:
+                        reason = sr.penalties[0] if isinstance(sr.penalties[0], str) else str(sr.penalties[0])
+                    results.append({
+                        "scanner": sr.scanner_name,
+                        "triggered": False,
+                        "reason": (reason or "")[:160],  # cap length
+                        "proximity": round(sr.raw_score, 1),
+                        "status": sr.scanner_status,
+                        "weight": round(sr.scanner_weight, 2),
+                    })
+
+            allowed_names = [s.__name__.replace("_scan_", "") for s in allowed_scanners]
+
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "symbol": symbol,
+                "regime": regime,
+                "atr_ratio": round(float(atr_ratio or 0), 3),
+                "allowed": allowed_names,
+                "session_id": session_id,
+                "results": results,
+            }
+
+            path = Path(__file__).resolve().parent.parent / "storage" / "research" / "scanner_funnel.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as fh:
+                fh.write(_json.dumps(record, default=str) + "\n")
+        except Exception:
+            # Funnel logging must never affect trading — swallow all errors
+            pass
 
     # ------------------------------------------------------------------
     # Interface
@@ -1396,6 +1826,43 @@ class ScalpStrategy(BaseStrategy):
         # Get allowed scanners for current regime
         allowed_scanners = REGIME_SCANNER_ROUTING.get(regime, [])
 
+        # --- Phase 4: Scanner Variant Adapter (regime_whitelist variants) ---
+        # Consult approved variants to potentially expand allowed_scanners.
+        # Shadow mode logs `variant_would_fire`; enforce mode adds scanners.
+        # Refreshed via mtime poll — cheap ~1x/min.
+        try:
+            self._refresh_research_scanner_variants()
+            if self._research_scanner_variants:
+                # Build full scanner method map once for variant lookup
+                _all_scanner_map = {
+                    "ema_momentum": self._scan_ema_momentum,
+                    "vwap_bounce": self._scan_vwap_bounce,
+                    "trend_continuation": self._scan_trend_continuation,
+                    "rsi_divergence": self._scan_rsi_divergence,
+                    "supertrend_flip": self._scan_supertrend_flip,
+                    "bb_squeeze": self._scan_bb_squeeze,
+                    "structure_bounce": self._scan_structure_bounce,
+                    "liquidity_sweep": self._scan_liquidity_sweep,
+                    "bos_choch": self._scan_bos_choch,
+                    "cvd_divergence": self._scan_cvd_divergence,
+                    "simple_bias": self._scan_simple_bias,
+                    "order_block_entry": self._scan_order_block_entry,
+                    "vwap_mean_revert": self._scan_vwap_mean_revert,
+                    "rsi_extreme": self._scan_rsi_extreme,
+                    "momentum_ride": self._scan_momentum_ride,
+                    "bb_band_walk": self._scan_bb_band_walk,
+                    "post_impulse": self._scan_post_impulse,
+                    "momentum_surge": self._scan_momentum_surge,
+                }
+                allowed_scanners = self._apply_regime_whitelist_variants(
+                    regime=regime,
+                    symbol=symbol,
+                    current_allowed=allowed_scanners,
+                    scanner_method_map=_all_scanner_map,
+                )
+        except Exception:
+            pass  # Never fail the scan loop on variant-adapter error
+
         # ── Indian Market Regime Override ──
         # During Indian flow hours, if regime is "quiet", override to allow
         # a limited set of ranging scanners. Indian retail flow creates setups
@@ -1458,6 +1925,23 @@ class ScalpStrategy(BaseStrategy):
             logger.info("FUNNEL %s | SCANNERS RUNNING #%d | regime=%s | scanners=%s | atr_ratio=%.2f",
                        symbol, pass_cnt, regime, scanner_list, self._atr_ratio)
 
+        # Option B fix (2026-04-28): Ensure confirm_df + df_5m have indicators
+        # computed BEFORE scanners use them. Previously these dfs went into the
+        # scanner_df path raw, causing scanners that index df["atr"]/df["rsi"]
+        # (rsi_divergence, rsi_extreme, bb_squeeze) to crash with KeyError on
+        # every scan — silently swallowed by the except at this method.
+        def _ensure_scanner_df(_d):
+            if _d is None or len(_d) < 20:
+                return _d
+            if "atr" in _d.columns and "rsi" in _d.columns and "bb_bandwidth" in _d.columns:
+                return _d  # already enriched
+            try:
+                return self._compute_indicators(_d)
+            except Exception:
+                return _d
+        confirm_df_enriched = _ensure_scanner_df(confirm_df)
+        df_5m_enriched = _ensure_scanner_df(df_5m)
+
         for scanner in allowed_scanners:
             label = scanner_names.get(scanner.__name__, scanner.__name__)
             setup_name = scanner.__name__.replace("_scan_", "")
@@ -1475,16 +1959,16 @@ class ScalpStrategy(BaseStrategy):
                     self._scan_trend_continuation, self._scan_ema_momentum, self._scan_bos_choch,
                     self._scan_cvd_divergence, self._scan_rsi_divergence, self._scan_vwap_mean_revert,
                 )
-                if scanner in _5m_scanners and df_5m is not None and len(df_5m) >= 50:
-                    scanner_df = df_5m
+                if scanner in _5m_scanners and df_5m_enriched is not None and len(df_5m_enriched) >= 50:
+                    scanner_df = df_5m_enriched
                 else:
                     scanner_df = df
 
                 # Try 15m first for structure/bos scanners (higher TF = higher quality)
                 result = None
                 # Try 15m FIRST for ALL scanners (universal quality opportunity)
-                if confirm_df is not None and len(confirm_df) >= 30:
-                    result = scanner(symbol, confirm_df, htf_bias, confirm_bias)
+                if confirm_df_enriched is not None and len(confirm_df_enriched) >= 30:
+                    result = scanner(symbol, confirm_df_enriched, htf_bias, confirm_bias)
                     if result is not None:
                         # 15m signal gets a quality bonus
                         result = _SetupResult(
@@ -1622,7 +2106,23 @@ class ScalpStrategy(BaseStrategy):
                     })
 
             except Exception as exc:
-                logger.debug("Setup scanner %s failed: %s", scanner.__name__, exc)
+                # Observability fix: previously logger.debug + only setups_checked.append.
+                # Result: silently swallowed scanner crashes never appeared in funnel JSONL,
+                # making 0%-trigger scanners (rsi_divergence, bb_squeeze, etc.) invisible.
+                # Now: warn to errors.log AND append a ScanResult so funnel reflects reality.
+                logger.warning("SCANNER CRASH %s on %s: %s: %s",
+                               scanner.__name__, symbol, type(exc).__name__, str(exc)[:200])
+                sr_err = ScanResult(
+                    scanner_name=setup_name,
+                    side=None,
+                    raw_score=0,
+                    weighted_score=0.0,
+                    tier=TIER_REJECTED,
+                    penalties=[f"EXCEPTION: {type(exc).__name__}: {str(exc)[:120]}"],
+                    scanner_weight=scanner_weight,
+                    scanner_status=scanner_status,
+                )
+                scan_results.append(sr_err)
                 setups_checked.append({
                     "name": label, "triggered": False,
                     "error": str(exc), "reason": diag,
@@ -1637,6 +2137,16 @@ class ScalpStrategy(BaseStrategy):
             nt_names = [sr.scanner_name for sr in not_triggered]
             logger.info("FUNNEL %s | SCAN RESULT #%d | triggered=%s | no_trigger=%s",
                        symbol, pass_cnt, t_names or "NONE", nt_names)
+
+        # --- Research Center: persist scanner-loop outcome for funnel analysis ---
+        # Pure additive, rate-limited to 1/min per symbol, fail-silent.
+        self._emit_funnel_sample(
+            symbol=symbol,
+            regime=regime,
+            atr_ratio=float(getattr(self, "_atr_ratio", 0) or 0),
+            allowed_scanners=allowed_scanners,
+            scan_results=scan_results,
+        )
 
         # ── Update setup lifecycle candidates for dashboard ──
         _lifecycle_candidates: List[Dict[str, Any]] = []
@@ -2168,12 +2678,16 @@ class ScalpStrategy(BaseStrategy):
                 # Do NOT apply dead-hour blocking during active Indian market flow
                 pass
             else:
-                ist_now_check = datetime.now(_IST)
-                utc_hour = (ist_now_check.hour - 5) % 24
-                dead_hours_hard = {2, 3, 4, 5}    # genuinely dead — hard block
-                dead_hours_soft = {10, 11}         # soft penalty only
+                # ASIA_EARLY_VETO_5_22 (2026-05-01) — extended hard-block hours.
+                # 24h shadow data: UTC 04-07 = 30 trades, 10% WR, -$22.14.
+                # Project weakspot map flags asia_early as -27 to -34pp WR.
+                # Use proper UTC datetime to avoid IST integer-subtract bugs.
+                from datetime import datetime as _dt_p6, timezone as _tz_p6
+                utc_hour = _dt_p6.now(_tz_p6.utc).hour
+                dead_hours_hard = {2, 3, 4, 5, 6, 7}  # was {2,3,4,5}; extended for asia-early bleed
+                dead_hours_soft = {10, 11}             # soft penalty only
                 if utc_hour in dead_hours_hard:
-                    vetos.append(f"DEAD SESSION: UTC hour {utc_hour} (2-5 UTC low liquidity)")
+                    vetos.append(f"DEAD SESSION: UTC hour {utc_hour} (asia-early low liquidity)")
                 elif utc_hour in dead_hours_soft and not self._is_learning:
                     _session_penalty = -10
                     best = _SetupResult(
@@ -2342,6 +2856,356 @@ class ScalpStrategy(BaseStrategy):
                     entry_price=best.entry_price, stop_loss=best.stop_loss, atr=best.atr,
                 )
 
+        # VETO 10f: DEAD-HOUR FILTER (data-driven, flag-gated, default off)
+        # 14d cohort analysis (n=98 primary shadow): hours 1, 3, 19 IST have
+        # avg loss -$3.31/trade (3.6× worse than overall -$0.90/trade avg).
+        # Together they cost $39.77/14d (~$2.84/day). Other hours bleed but at
+        # half the rate — keep them for forward learning. Easy save when on.
+        # Flag: HOUR_SKIP_FILTER=1 to enable.
+        if os.getenv("HOUR_SKIP_FILTER", "0") == "1":
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+            _ist_now = _dt.now(_tz.utc) + _td(hours=5, minutes=30)
+            _ist_hr_now = _ist_now.hour
+            _DEAD_HOURS_IST = (1, 3, 19)
+            if _ist_hr_now in _DEAD_HOURS_IST:
+                vetos.append(
+                    f"DEAD_HOUR_KILL: IST hour {_ist_hr_now} blocked "
+                    f"(14d cohort -$3.31/trade vs -$0.90 avg)"
+                )
+
+        # VETO 10e: BAD-EDGE SCANNER KILL LIST (data-driven, default ON)
+        # 6mo backtest (n>=3000 each) of 3 scanners that were silently crashing
+        # before the observability fix. All show negative net expectancy at
+        # Delta India taker fees:
+        #   rsi_divergence  n=13331  EV=-$1.20  (WR 33%, gross ~0, fees $1.18)
+        #   rsi_extreme     n=7574   EV=-$1.15  (WR 33%, gross ~0, fees $1.18)
+        #   bb_squeeze      n=3169   EV=-$1.22  (WR 31%, gross ~0, fees $1.18)
+        # Pattern: all 3 select ~33% WR setups with ~equal expected wins/losses
+        # — fees are the dominant cost and the strategies have no edge to absorb.
+        # Disable until they earn re-enable via standalone variant backtest.
+        # Flag: ENABLE_BAD_EDGE_SCANNERS=1 to override (default off = scanners stay killed)
+        _bad_edge_scanners = ("rsi_divergence", "rsi_extreme", "bb_squeeze")
+        if (best_sr.scanner_name in _bad_edge_scanners
+                and os.getenv("ENABLE_BAD_EDGE_SCANNERS", "0") != "1"):
+            vetos.append(
+                f"BAD_EDGE_SCANNER_KILL: {best_sr.scanner_name} disabled "
+                f"(6mo backtest EV ~-$1.20/trade after Delta taker fees)"
+            )
+
+        # VETO 10d: A+ STRUCTURE_BOUNCE SHORT KILL SWITCH (data-validated)
+        # Backtest 7d (n=62): A+ structure_bounce SHORT cohort: -$95.91, 19% WR.
+        # Same scanner grade A/B/C SHORT: only -$5.55 over 16 trades (~breakeven).
+        # Calibration is INVERTED — A+ rates the worst shorts highest. Killing
+        # this cohort saves ~$13.70/day with negligible opportunity cost
+        # (12 winners across 62 trades, total ~+$18 vs -$113 of losers).
+        # Flag: KILL_AP_SB_SHORTS=1 (default off — ship dark, enable per env)
+        if os.getenv("KILL_AP_SB_SHORTS", "0") == "1":
+            _g_killap = getattr(best, 'grade', None)
+            _gs_killap = _g_killap.value if hasattr(_g_killap, 'value') else str(_g_killap or '')
+            if (best_sr.scanner_name == "structure_bounce"
+                    and best.side == OrderSide.SHORT
+                    and _gs_killap == "A+"):
+                vetos.append(
+                    f"AP_SB_SHORT_KILL: A+ structure_bounce SHORT blocked "
+                    f"(7d backtest: -$95.91/62, calibration inverted)"
+                )
+
+        # VETO 10g: MACRO_EMA200_VETO (flag-gated, default off)
+        # Daily/4h close vs EMA200 defines bull/bear macro regime.
+        # 30d shadow backtest (n=98 primary): EMA200_d earned HOLD (only n=6 AGAINST,
+        # window was 100% bear macro for all 4 majors so daily filter had no
+        # separation power on shorts). EMA200_4h flagged 46 AGAINST trades for
+        # $67.26 savings (SHIP by spec) but per-trade WR separation was only
+        # ~2pp — savings come from cutting shorts during bear-rally bounces, not
+        # from a clean cohort gradient. EMA50_d had largest dollar impact (n=69
+        # AGAINST, $90.37) but is effectively a 75% short-side kill in this
+        # window — overfit to monoculture. Re-evaluate on a 60d mixed-regime
+        # window before global enable.
+        # Selectable filter via env (default 200_d):
+        #   MACRO_EMA200_VETO=0 (off — default)
+        #   MACRO_EMA200_VETO=1 (on, uses MACRO_EMA_FILTER which can be
+        #     'd_50','d_100','d_200','4h_50','4h_100','4h_200'; default 'd_200')
+        # macro_bias.parquet refreshed daily by scripts/ema200_macro_compute.py
+        if os.getenv("MACRO_EMA200_VETO", "0") == "1":
+            try:
+                _macro_bias_val = self._lookup_macro_bias(symbol)
+                _filter_kind = os.getenv("MACRO_EMA_FILTER", "d_200")
+                _macro_against = (
+                    (_macro_bias_val > 0 and best.side == OrderSide.SHORT)
+                    or (_macro_bias_val < 0 and best.side == OrderSide.LONG)
+                )
+                if _macro_against:
+                    _bias_label = "bull" if _macro_bias_val > 0 else "bear"
+                    vetos.append(
+                        f"MACRO_EMA200_VETO: {best.side.value} blocked vs "
+                        f"{_filter_kind}={_bias_label} "
+                        f"(30d backtest: AGAINST cohort -$varies; spec ship dark)"
+                    )
+            except Exception as _macro_e:  # noqa: BLE001
+                # Fail-open: never block trades on macro lookup error
+                logger.debug("MACRO_EMA200_VETO lookup failed: %s", _macro_e)
+
+        # VETO 10h: MACD_DIV_VETO (flag-gated, default off)
+        # Backtest 30d (n=99 OPPOSED, strength>=0.20): blocking trades whose
+        # direction opposes the 5m MACD divergence saves $95.65 net (~-$0.97/trade
+        # cohort EV vs -$0.67 NONE EV). Per-strength sensitivity:
+        #   strength <= 0.20: 37 trades, +$0.09 EV/trade — neutral, do NOT veto
+        #   strength 0.20-0.35: 87 trades, -$0.96 EV/trade — strong block
+        #   strength > 0.35:    12 trades, -$1.03 EV/trade — strong block
+        # 15m alone: bigger n (231) but ALIGNED-15m cohort actually loses MORE
+        # than NONE (-$1.22 vs -$0.56 EV) — 15m signal is "too late" so we use
+        # 5m only. Combined 5m+15m STRICT has only n=6 OPPOSED — too thin.
+        # Run by scripts/macd_div_counterfactual.py; report at
+        # storage/macd_div/report.md.
+        # Flag: MACD_DIV_VETO=1 (default off — ship dark, enable per env).
+        # Tunable: MACD_DIV_MIN_STRENGTH (default 0.20),
+        #          MACD_DIV_LOOKBACK (default 20).
+        if os.getenv("MACD_DIV_VETO", "0") == "1":
+            try:
+                from scripts.macd_divergence_detector import detect_divergence as _detect_div
+                _macd_div_min_str = float(os.getenv("MACD_DIV_MIN_STRENGTH", "0.20"))
+                _macd_div_lookback = int(os.getenv("MACD_DIV_LOOKBACK", "20"))
+                # use primary 5m df already in scope (variable name `df`).
+                # Detector needs >= max(slow=26, lookback) + pivot_n + 3 rows.
+                if df is not None and len(df) >= 35:
+                    _div = _detect_div(
+                        df,
+                        lookback=_macd_div_lookback,
+                        pivot_n=2,
+                        recent_window=6,
+                    )
+                    _div_type = str(_div.get("div_type", "none"))
+                    _div_strength = float(_div.get("div_strength", 0.0))
+                    _div_dir = int(_div.get("direction", 0))
+                    _div_opposes = (
+                        (best.side == OrderSide.LONG and _div_dir == -1)
+                        or (best.side == OrderSide.SHORT and _div_dir == +1)
+                    )
+                    if _div_opposes and _div_strength >= _macd_div_min_str:
+                        vetos.append(
+                            f"MACD_DIV_VETO: {best.side.value} blocked by opposing "
+                            f"{_div_type} on 5m (strength={_div_strength:.2f} "
+                            f">= {_macd_div_min_str:.2f}, 30d backtest -$95.65/99)"
+                        )
+            except Exception as _macd_div_e:  # noqa: BLE001
+                # Fail-open: never block trades on detector error
+                logger.debug("MACD_DIV_VETO error: %s", _macd_div_e)
+
+        # VETO 10i: HTF_HARD_VETO_AGRADE (flag-gated, default off)
+        # Walk-forward backtest 6mo (4 quarters Q1+Q2 IS, Q3+Q4 OOS):
+        # synthetic A-grade proxy = engulfing reversal in chop regime against 4h.
+        # BLOCKED cohort EV: IS=-0.157R, Q3=-0.018R, Q4=-0.238R (all NEGATIVE,
+        # all 3 splits) — clean walk-forward edge. KEPT cohort EV: IS=+0.107R,
+        # Q3=+0.054R, Q4=+0.268R (all POSITIVE). Veto helps in every quarter.
+        # Logic: when grade in (A+, A) AND 1h HTF (close vs ema21 vs ema50)
+        # opposes signal direction, block.
+        # Spec: scripts/scanner_refinements_backtest.py
+        #       storage/scanner_refinements/{report.md,walkforward.json}
+        # Flag: HTF_HARD_VETO_AGRADE=1 (default off — ship dark, enable per env)
+        # Shadow-trace mode: HTF_HARD_VETO_AGRADE=trace  → log but DO NOT block.
+        # Active mode:        HTF_HARD_VETO_AGRADE=1      → block (live behavior change).
+        # Default OFF:        HTF_HARD_VETO_AGRADE=0      → no veto, no logging.
+        _htfa_mode = os.getenv("HTF_HARD_VETO_AGRADE", "0").strip().lower()
+        if _htfa_mode in ("1", "trace"):
+            _g_htfa = getattr(best, 'grade', None)
+            _gs_htfa = _g_htfa.value if hasattr(_g_htfa, 'value') else str(_g_htfa or '')
+            if _gs_htfa in ("A+", "A") and htf_bias != 0:
+                _opposes_htfa = (
+                    (htf_bias > 0 and best.side == OrderSide.SHORT)
+                    or (htf_bias < 0 and best.side == OrderSide.LONG)
+                )
+                if _opposes_htfa:
+                    if _htfa_mode == "1":
+                        # ACTIVE veto — block the trade
+                        vetos.append(
+                            f"HTF_HARD_VETO_AGRADE: {_gs_htfa} {best.side.value} "
+                            f"blocked vs HTF={'bull' if htf_bias>0 else 'bear'} "
+                            f"(walk-fwd 6mo: blocked EV -0.157/-0.018/-0.238R IS/Q3/Q4)"
+                        )
+                    else:
+                        # SHADOW-TRACE: log what WOULD be blocked, don't actually block
+                        try:
+                            import json as _j_htfa
+                            from datetime import datetime as _dt_htfa, timezone as _tz_htfa
+                            from pathlib import Path as _P_htfa
+                            _trace_dir = _P_htfa("/home/opc/crypto-trading-bot/storage/htf_veto_trace")
+                            _trace_dir.mkdir(parents=True, exist_ok=True)
+                            _trace_record = {
+                                "timestamp": _dt_htfa.now(_tz_htfa.utc).isoformat(),
+                                "symbol": symbol,
+                                "side": best.side.value,
+                                "grade": _gs_htfa,
+                                "scanner": getattr(best_sr, "scanner_name", "?"),
+                                "htf_bias": int(htf_bias),
+                                "would_block": True,
+                                "current_action": "ALLOW",  # we did NOT block
+                                "confidence": int(getattr(best, "confidence", 0)),
+                                "regime": str(regime) if regime else None,
+                                "session_bias": indicators.get("session_bias", 0),
+                                "macro_bias": indicators.get("macro_bias", 0),
+                            }
+                            with (_trace_dir / "candidates.jsonl").open("a") as _f_htfa:
+                                _f_htfa.write(_j_htfa.dumps(_trace_record, default=str) + "\n")
+                        except Exception as _trace_err:
+                            logger.debug(f"HTF_VETO_TRACE log fail: {_trace_err}")
+                        # No vetos.append() — trade proceeds normally
+
+
+        # VETO 10j: VOLUME_CLIMAX_VETO (flag-gated, default off)
+        # Walk-forward backtest 6mo (4 quarters Q1+Q2 IS, Q3+Q4 OOS):
+        # Detector: rel_vol >= MIN on a candle that prints a new N-bar extreme
+        # with wick > body and recovery (LONG climax: close>open + lower wick;
+        # SHORT climax: close<open + upper wick). Climax direction = predicted
+        # reversal direction per the textbook capitulation/euphoria framing.
+        #
+        # WALK-FORWARD VERDICT: NO STANDALONE EDGE.
+        # 5m climax: median IS EV -0.803R across 140 cells (best -0.587R, all
+        # 140 negative). 15m climax: median IS EV -0.491R across 92 cells (all
+        # 92 negative). 1h climax: median IS EV -0.199R across 48 cells; only
+        # 4 of 48 cells positive IS, 1 cell passes WF (rv=2.0 lb=100 br=0.4
+        # ED: IS +0.053R n=33, Q3 +0.056R n=6, Q4 +0.217R n=16 — Q3 sample
+        # too thin for confidence). Climax-as-reversal hypothesis is empirically
+        # WRONG on intraday data; price tends to continue in the climax
+        # direction within our exit horizons. Flag stays default OFF until a
+        # cohort-specific (TF x exit x params) backtest shows the LIVE-SCALPER
+        # interaction (not standalone climax) saves money. Polarity below
+        # follows the spec wording: block when best.side opposes climax-implied
+        # reversal direction. Operators: do NOT enable without re-validating
+        # against fresh paper-trade history — standalone signal is anti-edge.
+        # Spec: scripts/volume_climax_walkforward.py
+        #       storage/volume_climax/{report.md,walkforward.json}
+        # Flag: VOLUME_CLIMAX_VETO=1 (default off — ship dark)
+        if os.getenv("VOLUME_CLIMAX_VETO", "0") == "1":
+            try:
+                if df is not None and len(df) >= 25:
+                    _vc_lookback = int(os.getenv("VOLUME_CLIMAX_LOOKBACK", "50"))
+                    _vc_min_rel = float(os.getenv("VOLUME_CLIMAX_MIN_REL", "3.0"))
+                    _vc_body_max = float(os.getenv("VOLUME_CLIMAX_BODY_MAX", "0.4"))
+                    # Inspect the LAST CLOSED candle of primary df.
+                    _vc_last = df.iloc[-1]
+                    _vc_o = float(_vc_last.get("open", 0.0))
+                    _vc_h = float(_vc_last.get("high", 0.0))
+                    _vc_l = float(_vc_last.get("low", 0.0))
+                    _vc_c = float(_vc_last.get("close", 0.0))
+                    _vc_vol = float(_vc_last.get("volume", 0.0))
+                    _vc_rng = max(_vc_h - _vc_l, 1e-12)
+                    _vc_body = abs(_vc_c - _vc_o)
+                    _vc_lo_wick = min(_vc_o, _vc_c) - _vc_l
+                    _vc_up_wick = _vc_h - max(_vc_o, _vc_c)
+                    _vc_body_ratio = _vc_body / _vc_rng
+                    # 20-bar avg volume excluding current bar
+                    _vc_vol_avg = float(df["volume"].iloc[-21:-1].mean())                         if len(df) >= 21 else 0.0
+                    _vc_rel = (_vc_vol / _vc_vol_avg) if _vc_vol_avg > 0 else 0.0
+                    # New N-bar extreme on prior N bars (exclude current)
+                    _vc_prior = df.iloc[-(_vc_lookback + 1):-1]
+                    _vc_new_low = (
+                        len(_vc_prior) >= _vc_lookback
+                        and _vc_l < float(_vc_prior["low"].min())
+                    )
+                    _vc_new_high = (
+                        len(_vc_prior) >= _vc_lookback
+                        and _vc_h > float(_vc_prior["high"].max())
+                    )
+                    _vc_long_climax = (
+                        _vc_rel >= _vc_min_rel
+                        and _vc_new_low
+                        and _vc_body_ratio < _vc_body_max
+                        and _vc_lo_wick > _vc_body
+                        and _vc_c > _vc_o
+                    )
+                    _vc_short_climax = (
+                        _vc_rel >= _vc_min_rel
+                        and _vc_new_high
+                        and _vc_body_ratio < _vc_body_max
+                        and _vc_up_wick > _vc_body
+                        and _vc_c < _vc_o
+                    )
+                    # Spec polarity: block when best.side opposes climax-implied
+                    # reversal direction (LONG climax => predicted UP =>
+                    # SHORT signal opposes => block).
+                    _vc_opposes = (
+                        (_vc_long_climax and best.side == OrderSide.SHORT)
+                        or (_vc_short_climax and best.side == OrderSide.LONG)
+                    )
+                    if _vc_opposes:
+                        _vc_dir = "LONG_CLIMAX" if _vc_long_climax else "SHORT_CLIMAX"
+                        vetos.append(
+                            f"VOLUME_CLIMAX_VETO: {best.side.value} blocked by "
+                            f"opposing {_vc_dir} (rel_vol={_vc_rel:.1f} >= "
+                            f"{_vc_min_rel:.1f}, lb={_vc_lookback}, "
+                            f"body_ratio={_vc_body_ratio:.2f} < {_vc_body_max:.2f})"
+                        )
+            except Exception as _vc_e:  # noqa: BLE001
+                # Fail-open: never block trades on detector error
+                logger.debug("VOLUME_CLIMAX_VETO error: %s", _vc_e)
+
+
+        # VETO 10k: WEDGE_BREAKOUT_VETO (flag-gated, default off)
+        # Walk-forward backtest 6mo (storage/classical_patterns/):
+        #   rising_wedge 1h EA: IS +0.145R / Q3 +0.298R / Q4 +0.379R (n=41/13/20) PASS
+        #   rising_wedge 1h EB: IS +0.197R / Q3 +0.349R / Q4 +0.333R (n=41/13/20) PASS
+        #   falling_wedge 4h EB: IS +0.281R / Q3 +0.439R / Q4 +0.183R (n=20/7/6) PASS (thin)
+        #
+        # WALK-FORWARD VERDICT: rising_wedge 1h is cleanest. Falling_wedge 4h
+        # has thin OOS samples (Q4 n=6). v1 ships 1h detection only via htf_df.
+        #
+        # Polarity: block trades OPPOSING the wedge breakout direction:
+        #   rising wedge breaks DOWN (bearish bias)  → veto LONG signals
+        #   falling wedge breaks UP (bullish bias)   → veto SHORT signals
+        #
+        # Spec: scripts/wedge_detector.py
+        #       scripts/classical_patterns_walkforward.py
+        #       storage/classical_patterns/{report.md, walkforward.json}
+        # Flag: WEDGE_BREAKOUT_VETO=1 (default off — ship dark, enable per env)
+        # Tunables: WEDGE_PIVOT_LB (default 5),
+        #           WEDGE_DETECT_WINDOW (default 30),
+        #           WEDGE_VOL_THRESHOLD (default 1.0)
+        if os.getenv("WEDGE_BREAKOUT_VETO", "0") == "1":
+            try:
+                if htf_df is not None and len(htf_df) >= 40:
+                    from scripts.wedge_detector import detect_wedge_breakout as _detect_wedge
+                    _w_pivot_lb = int(os.getenv("WEDGE_PIVOT_LB", "5"))
+                    _w_window = int(os.getenv("WEDGE_DETECT_WINDOW", "30"))
+                    _w_vol_thr = float(os.getenv("WEDGE_VOL_THRESHOLD", "1.0"))
+                    _wedge = _detect_wedge(
+                        htf_df,
+                        pivot_lb=_w_pivot_lb,
+                        detect_window=_w_window,
+                        vol_threshold=_w_vol_thr,
+                    )
+                    if _wedge is not None:
+                        _w_dir = _wedge["side"]  # "long" or "short" (the breakout direction)
+                        _w_type = _wedge["type"]  # "rising_wedge" or "falling_wedge"
+                        _w_opposes = (
+                            (_w_dir == "short" and best.side == OrderSide.LONG)
+                            or (_w_dir == "long" and best.side == OrderSide.SHORT)
+                        )
+                        if _w_opposes:
+                            vetos.append(
+                                f"WEDGE_BREAKOUT_VETO: {best.side.value} blocked by "
+                                f"opposing {_w_type} (1h breakout {_w_dir.upper()}, "
+                                f"WF: rising_wedge_1h_EB +0.197R/+0.349R/+0.333R)"
+                            )
+            except Exception as _w_e:  # noqa: BLE001
+                # Fail-open: never block trades on detector error
+                logger.debug("WEDGE_BREAKOUT_VETO error: %s", _w_e)
+
+
+        # VETO 10c: STRICT 4H TREND VETO (flag-gated, no confidence escape)
+        # Closes the conf>=85 hole in the SESSION VETO above.
+        # 24h shadow: 122 shorts -$95 vs 4 longs +$0.45 — short side is in
+        # regime mismatch when 4h is up. Existing SESSION VETO lets conf>=85
+        # shorts through; those are still bleeding.
+        # Flag: STRICT_4H_TREND_VETO=1 (default off — ship dark, enable per env)
+        if _sb != 0 and os.getenv("STRICT_4H_TREND_VETO", "0") == "1":
+            _sb_opposes_strict = (_sb < 0 and best.side == OrderSide.LONG) or \
+                                 (_sb > 0 and best.side == OrderSide.SHORT)
+            if _sb_opposes_strict:
+                vetos.append(
+                    f"STRICT 4H VETO: {best.side.value} blocked vs 4h="
+                    f"{'bull' if _sb>0 else 'bear'} (conf={best.confidence}, flag=ON)"
+                )
+
         # VETO 11: VWAP Direction Filter — SOFTENED to confidence penalty (-15)
         # Was: hard block. Now: -15 confidence penalty (lets good setups through)
         # LONG: price > VWAP AND trend_strength > threshold
@@ -2397,9 +3261,46 @@ class ScalpStrategy(BaseStrategy):
         # Only truly dangerous vetos stay hard. Others become confidence penalties.
         is_sb = best_sr.scanner_name == "structure_bounce"
 
+        # HIGH_VOL_VETO_SB_5_22 — block structure_bounce in high_volatility regime.
+        # Data 2026-05-01: 23 such trades = 9% WR, -$1.61 avg, -$37/24h.
+        try:
+            _regime_now_p5 = (locals().get('regime') or getattr(self, '_last_regime_str', '') or '').lower()
+        except Exception:
+            _regime_now_p5 = ''
+        if is_sb and _regime_now_p5 == "high_volatility":
+            vetos.append(f"HIGH_VOL_REGIME_VETO_SB: structure_bounce blocked in high_volatility regime")
+
         # For structure_bounce: only HTF, CHOCH, and REGIME MISMATCH are hard vetos
         # Everything else (ATR, Volume, No-Chase, Candle quality, Cooldown, Session) → soft penalty
-        sb_hard_prefixes = ("CHOCH CONFLICT:", "REGIME MISMATCH:", "REGIME SIDE:")
+        # HIGH_VOL_VETO_SB_5_22 (2026-05-01) — added HIGH_VOL_REGIME_VETO_SB
+        # to the hard-veto list. 23 high_volatility structure_bounce trades
+        # in 24h cost -$37 (avg -$1.61/trade, 9% WR). Mean-reversion has no
+        # edge when levels get blown through.
+        # BATCH_F_5_22 (2026-05-02) — added "DEAD SESSION:" so the asia_early
+        # veto (lines ~2675) actually enforces on structure_bounce signals.
+        # Pre-patch: 06:00 UTC hour produced 17% WR / -$3.42 avg in paper
+        # because "DEAD SESSION:" was appended to vetos but not in the
+        # hard-prefix list — silent no-op for the bot's #1 scanner.
+        # PATCH_JK_5_22 (2026-05-02) — Circuit breaker (Patch J) + ATR regime gate (Patch K).
+        # Both append to vetos list with prefixes that are hard-killed for SB.
+        # Patch J: if last 20 SB trades have WR < 40%, pause new SB entries 60min.
+        # Patch K: if symbol's 4h ATR is in bottom 30%ile, block SB (chop allergy).
+        try:
+            if _patch_jk_get_tracker is not None:
+                _cb_veto = _patch_jk_get_tracker().is_blocked(best_sr.scanner_name)
+                if _cb_veto:
+                    vetos.append(_cb_veto)
+        except Exception:
+            pass
+        try:
+            if _patch_jk_get_regime_gate is not None:
+                _rg_veto = _patch_jk_get_regime_gate().is_blocked(symbol, best_sr.scanner_name)
+                if _rg_veto:
+                    vetos.append(_rg_veto)
+        except Exception:
+            pass
+
+        sb_hard_prefixes = ("CHOCH CONFLICT:", "REGIME MISMATCH:", "REGIME SIDE:", "STRICT 4H VETO:", "AP_SB_SHORT_KILL:", "BAD_EDGE_SCANNER_KILL:", "DEAD_HOUR_KILL:", "MACRO_EMA200_VETO:", "MACD_DIV_VETO:", "HTF_HARD_VETO_AGRADE:", "VOLUME_CLIMAX_VETO:", "WEDGE_BREAKOUT_VETO:", "HIGH_VOL_REGIME_VETO_SB:", "DEAD SESSION:")  # DEADLOCK_FIX_5_22 — removed CIRCUIT_BREAKER_J + ATR_REGIME_K (caused permanent SB lockout)
         # HTF STRICT moved to soft — in choppy markets 1H often disagrees with 5m entries
         sb_soft_prefixes = ("HTF STRICT:", "LOW VOLATILITY:", "NO VOLUME:", "NO CHASE:", "WEAK CANDLE:",
                             "COOLDOWN:")
@@ -2920,6 +3821,9 @@ class ScalpStrategy(BaseStrategy):
             # Phase 4.5: pass symbol + side so server can route to the family
             # model (liquid_majors / secondary / high_beta) before falling back
             # to the per-scanner model.
+            # LIVE_OUTCOME_WIRING_5_22 — populated AFTER ml_result below
+            _live_outcome_result = {"probability": 0.5, "verdict": "NOT_CALLED",
+                                     "model_age_hours": None, "error": None}
             ml_result = self._ml_scorer.score_candidate(
                 scanner_name=best_sr.scanner_name,
                 features=ml_features,
@@ -3228,7 +4132,37 @@ class ScalpStrategy(BaseStrategy):
         signal.metadata["p_win"] = round(ev_result.p_win, 4)
 
         # ── ML scoring metadata ──
-        signal.metadata["ml_probability"] = round(ml_result.get("probability", 0.5), 4)
+        # Defensive `or 0.5` — `.get("probability", 0.5)` returns None if the
+        # key is PRESENT with value None (observed 2026-04-22: 3 tracebacks
+        # in 40 min from TypeError: NoneType doesn't define __round__).
+        # Dict-default only fires for MISSING keys, not null values. No WR
+        # impact — a null probability is equivalent to an absent ML result.
+        # LIVE_OUTCOME_WIRING_5_22 — score same signal with PnL-trained model.
+        # Fail-open: any error → 0.5 neutral, doesn't block trade.
+        if getattr(self, "_live_outcome_scorer", None) is not None:
+            try:
+                _live_outcome_result = self._live_outcome_scorer.score({
+                    "regime":            regime,
+                    "scanner":           best_sr.scanner_name,
+                    "side":              "long" if best.side == OrderSide.LONG else "short",
+                    "session":           getattr(self, "_current_session", "us"),
+                    "symbol":            symbol,
+                    "trade_type":        getattr(best, "trade_type", "SCALP") or "SCALP",
+                    "confidence":        best.confidence,
+                    "atr_ratio":         getattr(self, "_atr_ratio", 1.0),
+                    "ml_probability":    ml_result.get("probability", 0.5),
+                    "leverage":          20,    # Phase 1: placeholder
+                    "position_size_usd": 5000,  # Phase 1: placeholder
+                })
+            except Exception as _e:
+                logger.error("LiveOutcomeScorer.score failed: %s", _e)
+                _live_outcome_result["error"] = str(_e)[:100]
+        signal.metadata["live_outcome_prob"]    = round(_live_outcome_result.get("probability", 0.5), 4)
+        signal.metadata["live_outcome_verdict"] = _live_outcome_result.get("verdict", "?")
+        signal.metadata["live_outcome_age_h"]   = round(_live_outcome_result.get("model_age_hours") or 0, 1)
+        if _live_outcome_result.get("error"):
+            signal.metadata["live_outcome_error"] = str(_live_outcome_result["error"])[:120]
+        signal.metadata["ml_probability"] = round(ml_result.get("probability") or 0.5, 4)
         signal.metadata["ml_verdict"] = ml_result.get("verdict", "?")
         signal.metadata["ml_latency_ms"] = ml_result.get("latency_ms", 0)
         signal.metadata["ml_shadow_mode"] = self._ml_shadow_mode
@@ -3516,6 +4450,50 @@ class ScalpStrategy(BaseStrategy):
                 all_candidates.append(entry)
         all_candidates.sort(key=lambda c: c.get("score", 0), reverse=True)
         return {"candidates": all_candidates[:6]}
+
+    # ------------------------------------------------------------------
+    # Macro EMA bias lookup (for VETO 10g MACRO_EMA200_VETO)
+    # ------------------------------------------------------------------
+
+    def _lookup_macro_bias(self, symbol: str) -> int:
+        """Return macro bias for a symbol from cached parquet.
+
+        Reads storage/ema200_data/macro_bias.parquet (refreshed daily by
+        scripts/ema200_macro_compute.py). Returns the bias value (+1 / 0 / -1)
+        for the env-selected filter (MACRO_EMA_FILTER, default 'd_200') for the
+        most recent closed bar at or before *now*.
+
+        Cached in-memory for 1 hour; returns 0 (neutral, no veto) on any error
+        so the veto fails open rather than blocking trades on infra issues.
+        """
+        col = "macro_bias_" + os.getenv("MACRO_EMA_FILTER", "d_200")
+        try:
+            cache = getattr(self, "_macro_bias_cache", None)
+            now = time.time()
+            if cache is None or (now - cache.get("loaded_at", 0)) > 3600:
+                pq = Path("/home/opc/crypto-trading-bot/storage/ema200_data/macro_bias.parquet")
+                if not pq.exists():
+                    return 0
+                df = pd.read_parquet(pq)
+                df["ts"] = pd.to_datetime(df["ts"], utc=True)
+                self._macro_bias_cache = {
+                    "loaded_at": now,
+                    "frame": df.sort_values(["symbol", "ts"]).reset_index(drop=True),
+                }
+                cache = self._macro_bias_cache
+            sym_short = symbol.split("/")[0]
+            sub = cache["frame"]
+            sub = sub[sub["symbol"] == sym_short]
+            if sub.empty or col not in sub.columns:
+                return 0
+            now_utc = pd.Timestamp.now(tz="UTC")
+            row = sub[sub["ts"] <= now_utc].tail(1)
+            if row.empty:
+                return 0
+            val = int(row.iloc[0][col])
+            return val if val in (-1, 0, 1) else 0
+        except Exception:  # noqa: BLE001
+            return 0
 
     # ------------------------------------------------------------------
     # Indicator computation (lightweight for 1m data)
@@ -4081,11 +5059,11 @@ class ScalpStrategy(BaseStrategy):
             return None
 
         last = df.iloc[-1]
-        atr = last["atr"]
-        close = last["close"]
-        rsi_now = last["rsi"]
+        atr = last.get("atr", 0)
+        close = last.get("close", 0)
+        rsi_now = last.get("rsi", float("nan"))
 
-        if atr <= 0 or np.isnan(atr) or np.isnan(rsi_now):
+        if atr <= 0 or np.isnan(atr) or np.isnan(rsi_now) or "rsi" not in df.columns:
             return None
 
         window = df.iloc[-(lookback + 1):]
@@ -4333,10 +5311,10 @@ class ScalpStrategy(BaseStrategy):
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
-        atr = last["atr"]
-        close = last["close"]
+        atr = last.get("atr", 0)
+        close = last.get("close", 0)
 
-        if atr <= 0 or np.isnan(atr):
+        if atr <= 0 or np.isnan(atr) or "bb_bandwidth" not in df.columns:
             return None
 
         bw_now = last.get("bb_bandwidth", 0)
@@ -4544,17 +5522,21 @@ class ScalpStrategy(BaseStrategy):
             curr_vol = 1.0
         best_vol = max(rej_vol, curr_vol)
 
+        # WYCKOFF_VOLUME_GATE_5_21 (2026-04-30) - hard veto on low volume.
+        # Was: -5 score penalty. Was admitting ~78/133 trades in 0.0-0.15R
+        # peak bucket per 24h shadow data - 1 win/78. Wyckoff: low vol = trap.
+        if best_vol < 1.0:
+            return None
+
         if best_vol > 1.5:
             confs.append(f"Volume spike {best_vol:.1f}×")
             score += 15
         elif best_vol > 1.2:
             confs.append(f"Volume {best_vol:.1f}×")
             score += 10
-        elif best_vol > 0.9:
-            score += 5
         else:
-            # Low volume at structure = weak bounce, still allow but penalize
-            score -= 5
+            confs.append(f"Volume {best_vol:.1f}× (at-median)")
+            score += 5
 
         # --- STEP 4: Confirmation candle (current bar closes away from level) ---
         if rejection_bar_idx == 1:
@@ -5593,16 +6575,16 @@ class ScalpStrategy(BaseStrategy):
         last = df.iloc[-1]
         prev = df.iloc[-2]
         prev2 = df.iloc[-3]
-        atr = last["atr"]
-        close = last["close"]
-        open_ = last["open"]
+        atr = last.get("atr", 0)
+        close = last.get("close", 0)
+        open_ = last.get("open", 0)
 
-        if atr <= 0 or np.isnan(atr):
+        if atr <= 0 or np.isnan(atr) or "rsi" not in df.columns:
             return None
 
-        rsi = last["rsi"]
-        rsi_prev = prev["rsi"]
-        rsi_prev2 = prev2["rsi"]
+        rsi = last.get("rsi", float("nan"))
+        rsi_prev = prev.get("rsi", float("nan"))
+        rsi_prev2 = prev2.get("rsi", float("nan"))
 
         if np.isnan(rsi) or np.isnan(rsi_prev):
             return None

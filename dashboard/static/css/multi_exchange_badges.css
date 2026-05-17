@@ -1,0 +1,131 @@
+/* Multi-exchange trade badges + Trade Stream panel
+ * 2026-04-26: clear visual differentiation for paper/shadow/demo/real × delta/bybit
+ */
+
+/* ── Trade-type badges (color = "what kind of money") ── */
+.tt-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 0.55rem;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  font-family: var(--font-mono);
+  vertical-align: middle;
+  margin-right: 4px;
+  border: 1px solid transparent;
+}
+.tt-badge--paper  { background: rgba(56, 189, 248, 0.10);  color: var(--info, #38bdf8);    border-color: rgba(56, 189, 248, 0.28); }
+.tt-badge--shadow { background: rgba(167, 139, 250, 0.10); color: var(--purple, #a78bfa); border-color: rgba(167, 139, 250, 0.28); }
+.tt-badge--demo   { background: rgba(245, 158, 11, 0.10);  color: var(--warning, #f59e0b); border-color: rgba(245, 158, 11, 0.28); }
+.tt-badge--real   { background: rgba(239, 68, 68, 0.10);   color: var(--danger, #ef4444);  border-color: rgba(239, 68, 68, 0.28); }
+
+/* ── Exchange badges (color = "which venue") ── */
+.ex-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 0.55rem;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  font-family: var(--font-mono);
+  vertical-align: middle;
+  margin-right: 4px;
+  border: 1px solid transparent;
+}
+.ex-badge--delta_india { background: rgba(255, 165, 0, 0.10);   color: #ffa500;                 border-color: rgba(255, 165, 0, 0.28); }
+.ex-badge--bybit       { background: rgba(255, 215, 0, 0.10);   color: #ffd700;                 border-color: rgba(255, 215, 0, 0.28); }
+.ex-badge--okx         { background: rgba(139, 92, 246, 0.10);  color: #8b5cf6;                 border-color: rgba(139, 92, 246, 0.28); }
+.ex-badge--paper       { background: rgba(107, 119, 148, 0.08); color: var(--text-tertiary);   border-color: rgba(107, 119, 148, 0.20); }
+
+/* ── Trade Stream panel ── */
+.tx-stream {
+  background: var(--bg-card, #0f1524);
+  border: 1px solid var(--border, rgba(255,255,255,0.06));
+  border-radius: 6px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  font-family: var(--font-mono);
+}
+.tx-stream-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+.tx-stream-title {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--text-primary);
+}
+.tx-stream-controls { display: flex; gap: 8px; align-items: center; font-size: 0.65rem; }
+.tx-stream-sel {
+  background: var(--bg-input, #060912);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  padding: 3px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+}
+
+.tx-stream-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+.tx-stream-table th {
+  text-align: left;
+  color: var(--text-tertiary);
+  font-weight: 600;
+  font-size: 0.55rem;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.tx-stream-table th.num { text-align: right; }
+.tx-stream-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  white-space: nowrap;
+}
+.tx-stream-table td.num { text-align: right; }
+.tx-stream-table tr:hover { background: rgba(255,255,255,0.02); }
+
+.tx-stream-empty {
+  color: var(--text-tertiary);
+  font-style: italic;
+  font-size: 0.78rem;
+  padding: 14px 0;
+  text-align: center;
+}
+
+/* Side badges (long/short) */
+.side-tag {
+  display: inline-block;
+  padding: 0 4px;
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  border-radius: 2px;
+}
+.side-tag--long  { background: rgba(34, 197, 94, 0.12); color: var(--success); }
+.side-tag--short { background: rgba(239, 68, 68, 0.12); color: var(--danger); }
+
+/* Sticky filter row inside long lists */
+.tx-stream-meta {
+  font-size: 0.6rem;
+  color: var(--text-tertiary);
+  margin-top: 8px;
+}

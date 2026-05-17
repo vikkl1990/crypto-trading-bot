@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Backtest Reports{% endblock %}
+
+{% block content %}
+<h1>Backtest Reports</h1>
+<p class="subtitle">Mirrored from VM1 storage/. Click any file to view rendered.</p>
+
+{% for r in reports %}
+<h2 id="{{ r.dir }}" style="display:flex;align-items:center;gap:10px;">
+  <span>{{ r.dir }}/</span>
+  {% if r.missing %}<span class="badge dim">not yet synced</span>{% else %}<span class="badge neutral">{{ r.files|length }} files</span>{% endif %}
+</h2>
+{% if r.missing %}
+<div class="empty-state" style="text-align:left;padding:14px 20px;">
+  Directory <code style="color:var(--warning);">{{ r.dir }}</code> not present in synced data. Either it doesn't exist on VM1 or sync hasn't run yet.
+</div>
+{% elif r.files %}
+<div class="file-grid">
+  {% for f in r.files %}
+  <a href="{{ url_for('backtest_file', relpath=f.path) }}" class="file-item">
+    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ f.name }}</span>
+    <span style="display:flex;gap:6px;align-items:center;">
+      <span style="color:var(--text-tertiary);font-size:9.5px;">{{ f.size_kb }}KB</span>
+      <span class="ext {{ f.ext }}">{{ f.ext }}</span>
+    </span>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state" style="text-align:left;padding:14px 20px;">No files in this directory.</div>
+{% endif %}
+{% endfor %}
+{% endblock %}

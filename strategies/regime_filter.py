@@ -518,9 +518,12 @@ def calc_confidence_size_multiplier(confidence: int, tier: str) -> float:
     Weak signals (50-64) get reduced size.
     """
     if tier == "strong":
-        if confidence >= 90:
-            return 1.3  # exceptional signal
-        return 1.1
+        # AB_SIZE_CAP_5_22 (2026-05-01) — was 1.3 boost on conf>=90 (A+).
+        # 24h shadow data: A+ x ML 0.80+ = 32 trades, 22% WR, -$1.20 avg.
+        # ML calibration is anti-predictive at top. Capping all "strong"
+        # at 1.0 removes the A+ amplifier without changing trade selection.
+        # Estimated saving: $25-35/24h.
+        return 1.0
     elif tier == "valid":
         return 1.0
     elif tier == "weak":

@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+<a href="{{ url_for('backtest_browser') }}" style="font-size: 11px; color: var(--text-tertiary);">← back to backtest browser</a>
+<h1 style="margin-top:6px;">{{ title }} <span class="badge {% if kind == 'md' %}purple{% elif kind == 'csv' %}info{% else %}warning{% endif %}" style="margin-left:8px;">{{ kind }}</span></h1>
+
+<div class="panel" style="margin-top: 16px;">
+  {% if body_html %}
+    {% if kind == 'md' %}
+      <div class="md-body">{{ body_html | safe }}</div>
+    {% else %}
+      <div class="scroll-wrap" style="border:0;background:transparent;">{{ body_html | safe }}</div>
+    {% endif %}
+  {% elif raw %}
+    <pre class="code-block">{{ raw }}</pre>
+  {% else %}
+    <div class="empty-state">No content.</div>
+  {% endif %}
+</div>
+{% endblock %}

@@ -65,6 +65,8 @@ class TimeframesConfig:
     primary: str = "5m"
     higher: str = "15m"
     trigger: str = "1m"
+    macro: str = "1h"
+    session: str = "4h"
 
 
 @dataclass(frozen=True)

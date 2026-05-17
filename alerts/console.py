@@ -131,7 +131,19 @@ class ConsoleAlerter:
         color = _Color.GREEN if is_buy else _Color.RED
         direction = signal_type.upper().replace("_", " ")
 
-        price = sig.get("price", 0.0)
+        # 2026-04-26: signal dicts inconsistently set "price" — fall back through
+        # the alternate fields the strategy/scanner may have populated. Cosmetic
+        # fix; before this, "Price: $0.000000" showed up in PRE BUY CONFIRMED
+        # logs even when the strategy had a valid entry on `entry_price` or
+        # `metadata.entry`.
+        price = (
+            sig.get("price")
+            or sig.get("entry_price")
+            or sig.get("entry")
+            or (sig.get("metadata", {}) or {}).get("entry")
+            or (sig.get("metadata", {}) or {}).get("entry_price")
+            or 0.0
+        )
         sl = sig.get("stop_loss", sig.get("sl"))
         tp1 = sig.get("tp1", sig.get("take_profit_1"))
         tp2 = sig.get("tp2", sig.get("take_profit_2"))

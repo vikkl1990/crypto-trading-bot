@@ -703,6 +703,24 @@ class MLDashboard:
         self._app.router.add_get("/api/feature-drift", self._handle_feature_drift)
         self._app.router.add_get("/api/scanner-rankings", self._handle_scanner_rankings)
         self._app.router.add_get("/api/backtest-all", self._handle_backtest_all)
+
+        # Research Center endpoints (2026-04-17) — "ML as innovation lab"
+        self._app.router.add_get("/api/research/cohort-health", self._handle_research_cohort_health)
+        self._app.router.add_get("/api/research/weakspots", self._handle_research_weakspots)
+        self._app.router.add_get("/api/research/policy-variants", self._handle_research_policy_variants)
+        self._app.router.add_get("/api/research/edge-trajectory", self._handle_research_edge_trajectory)
+        self._app.router.add_get("/api/research/suggestions", self._handle_research_suggestions)
+        self._app.router.add_get("/api/research/vetoes", self._handle_research_vetoes)
+        self._app.router.add_get("/api/research/timeline", self._handle_research_timeline)
+        self._app.router.add_post("/api/research/refresh", self._handle_research_refresh)
+        self._app.router.add_get("/api/research/summary", self._handle_research_summary)
+        self._app.router.add_get("/research", self._handle_research_page)
+        # Mutating endpoints (human-in-loop actions from UI)
+        self._app.router.add_post("/api/research/suggestions/approve", self._handle_research_suggestions_approve)
+        self._app.router.add_post("/api/research/suggestions/reject", self._handle_research_suggestions_reject)
+        self._app.router.add_post("/api/research/vetoes/add", self._handle_research_vetoes_add)
+        self._app.router.add_post("/api/research/vetoes/remove", self._handle_research_vetoes_remove)
+
         # Serve static files
         static_dir = PROJECT_ROOT / "dashboard" / "static"
         if static_dir.exists():
@@ -2105,6 +2123,304 @@ class MLDashboard:
             return _error_response("backtest_all", str(e))
 
     # -------------------------------------------------------------------
+    #  Research Center — "ML as innovation lab" (2026-04-17)
+    # -------------------------------------------------------------------
+    # These handlers delegate to ml_training/research_center.py which
+    # runs the analyses in a background scheduler and caches results.
+    # User-facing latency is <50ms because handlers only read the cache.
+
+    def _research(self):
+        """Lazy-import the research center singleton (avoid import-cycle at module load)."""
+        try:
+            from ml_training.research_center import get_center
+            return get_center()
+        except Exception as e:
+            logger.warning("research_center unavailable: %s", e)
+            return None
+
+    def _cached_or_live(self, key: str, fallback):
+        """Return cached if fresh, else compute live (slower path)."""
+        rc = self._research()
+        if rc is not None:
+            cached = rc.get(key)
+            if cached is not None:
+                return cached
+        try:
+            return fallback()
+        except Exception as e:
+            logger.warning("research %s live compute failed: %s", key, e)
+            return {"error": str(e)}
+
+    async def _handle_research_cohort_health(self, request):
+        from ml_training.research_center import analyze_cohort_health
+        return web.json_response(
+            self._cached_or_live("cohort_health", analyze_cohort_health),
+            dumps=_json_dumps,
+        )
+
+    async def _handle_research_weakspots(self, request):
+        from ml_training.research_center import mine_weakspots
+        days = int(request.query.get("days", 30))
+        min_n = int(request.query.get("min_n", 30))
+        # Use cache for default params only; live-compute for custom
+        if days == 30 and min_n == 30:
+            return web.json_response(
+                self._cached_or_live("weakspots", lambda: mine_weakspots(days, min_n)),
+                dumps=_json_dumps,
+            )
+        return web.json_response(mine_weakspots(days, min_n), dumps=_json_dumps)
+
+    async def _handle_research_policy_variants(self, request):
+        from ml_training.research_center import propose_policy_variants
+        return web.json_response(
+            self._cached_or_live("policy_variants", lambda: propose_policy_variants(30)),
+            dumps=_json_dumps,
+        )
+
+    async def _handle_research_edge_trajectory(self, request):
+        from ml_training.research_center import edge_trajectory
+        days = int(request.query.get("days", 14))
+        bucket_hours = int(request.query.get("bucket_hours", 6))
+        if days == 14 and bucket_hours == 6:
+            return web.json_response(
+                self._cached_or_live("edge_trajectory", lambda: edge_trajectory(days, bucket_hours)),
+                dumps=_json_dumps,
+            )
+        return web.json_response(edge_trajectory(days, bucket_hours), dumps=_json_dumps)
+
+    async def _handle_research_suggestions(self, request):
+        from ml_training.research_center import scan_suggestions
+        return web.json_response(scan_suggestions(), dumps=_json_dumps)
+
+    async def _handle_research_vetoes(self, request):
+        from ml_training.research_center import active_vetoes
+        return web.json_response(active_vetoes(), dumps=_json_dumps)
+
+    async def _handle_research_timeline(self, request):
+        from ml_training.research_center import timeline
+        limit = int(request.query.get("limit", 50))
+        return web.json_response({"events": timeline(limit), "count": 0}, dumps=_json_dumps)
+
+    async def _handle_research_refresh(self, request):
+        """POST — force refresh all research caches. Admin-triggered."""
+        rc = self._research()
+        if rc is None:
+            return web.json_response({"error": "research_center not available"}, status=503)
+        try:
+            await asyncio.to_thread(rc.refresh_all, True)
+            return web.json_response({"status": "ok", "refreshed_at": datetime.now(timezone.utc).isoformat()})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_research_summary(self, request):
+        """Headline summary for the Research tab landing view."""
+        from ml_training.research_center import (
+            analyze_cohort_health, mine_weakspots, scan_suggestions, active_vetoes,
+        )
+        health = self._cached_or_live("cohort_health", analyze_cohort_health)
+        weak = self._cached_or_live("weakspots", lambda: mine_weakspots(30, 30))
+        sug = scan_suggestions()
+        vetoes = active_vetoes()
+
+        summary = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "cohort_health": {
+                "healthy": (health or {}).get("healthy_count", 0),
+                "degraded": (health or {}).get("degraded_count", 0),
+                "alerts": (health or {}).get("alerts", [])[:5],
+            },
+            "weakspots": {
+                "count": len((weak or {}).get("weakspots", [])),
+                "top_3": (weak or {}).get("weakspots", [])[:3],
+                "baseline_wr": (weak or {}).get("baseline_wr", 0),
+            },
+            "suggestions": {
+                "pending": sug.get("count", 0),
+            },
+            "vetoes": {
+                "active": vetoes.get("count", 0),
+            },
+        }
+        return web.json_response(summary, dumps=_json_dumps)
+
+    # -------------------------------------------------------------------
+    #  Research UI page + mutating endpoints
+    # -------------------------------------------------------------------
+    async def _handle_research_page(self, request):
+        """GET /research — serve the Research Center HTML page."""
+        template_path = PROJECT_ROOT / "ml_training" / "templates" / "research.html"
+        if not template_path.exists():
+            return web.Response(
+                text="<h1>Research page not deployed</h1>",
+                content_type="text/html", status=503,
+            )
+        try:
+            return web.Response(
+                body=template_path.read_bytes(),
+                content_type="text/html",
+                headers={"Cache-Control": "no-cache"},
+            )
+        except Exception as e:
+            return web.Response(text=f"Error: {e}", status=500)
+
+    def _research_file(self, name: str):
+        """Path helper — storage/research/{name}."""
+        from pathlib import Path as _P
+        d = PROJECT_ROOT / "storage" / "research"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / name
+
+    def _read_json_or_default(self, path, default):
+        """Safe JSON read — returns default if missing/corrupt."""
+        import json as _j
+        try:
+            if not path.exists():
+                return default
+            with open(path) as fh:
+                return _j.load(fh)
+        except Exception:
+            return default
+
+    def _write_json_atomic(self, path, data):
+        """Atomic write via tmp+rename."""
+        import json as _j, os as _os
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w") as fh:
+            _j.dump(data, fh, indent=2, default=str)
+        _os.replace(tmp, path)
+
+    def _append_event(self, kind: str, payload: dict):
+        """Emit to storage/research/events.jsonl (same format as research_center)."""
+        import json as _j
+        path = self._research_file("events.jsonl")
+        evt = {"ts": datetime.now(timezone.utc).isoformat(), "kind": kind, **payload}
+        try:
+            with open(path, "a") as fh:
+                fh.write(_j.dump(evt, default=str) if False else "")
+                # use json.dumps properly
+                fh.write(_j.dumps(evt, default=str) + "\n")
+        except Exception as e:
+            logger.warning("append_event failed: %s", e)
+
+    async def _handle_research_suggestions_approve(self, request):
+        """POST /api/research/suggestions/approve — record an approved variant
+        for later shadow-mode enforcement by the bot's prefilter adapter.
+
+        Stored in storage/research/approved_variants.json. NEVER auto-enforced.
+        Phase-1 contract: bot reads this file and LOGS what it would do
+        (vwap_would_veto style), but does not change trading behavior
+        until a follow-up commit flips the enforce flag.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+
+        path = self._research_file("approved_variants.json")
+        store = self._read_json_or_default(path, {"variants": [], "updated_at": None})
+        body.setdefault("approved_at", datetime.now(timezone.utc).isoformat())
+        body.setdefault("mode", "shadow")
+        body["id"] = f"var_{int(datetime.now(timezone.utc).timestamp())}_{len(store['variants'])}"
+        store["variants"].append(body)
+        store["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_json_atomic(path, store)
+        self._append_event("variant_approved", {
+            "id": body["id"],
+            "cohort": body.get("cohort"),
+            "params": body.get("params"),
+            "mode": body.get("mode"),
+        })
+        return web.json_response({"status": "ok", "id": body["id"], "mode": "shadow"})
+
+    async def _handle_research_suggestions_reject(self, request):
+        """POST /api/research/suggestions/reject — record rejection reason."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+
+        path = self._research_file("rejected_variants.jsonl")
+        body["rejected_at"] = datetime.now(timezone.utc).isoformat()
+        import json as _j
+        with open(path, "a") as fh:
+            fh.write(_j.dumps(body, default=str) + "\n")
+        self._append_event("variant_rejected", {
+            "cohort": body.get("cohort"),
+            "reason": body.get("reason", "unspecified"),
+        })
+        return web.json_response({"status": "ok"})
+
+    async def _handle_research_vetoes_add(self, request):
+        """POST /api/research/vetoes/add — freeze a cohort.
+
+        Phase-1 SHADOW MODE: writes to storage/research/active_vetoes.json
+        where the bot's prefilter adapter reads it. Currently the adapter
+        only LOGS would_veto — doesn't actually block. Enforcement
+        flip is a separate commit after observation.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+
+        scanner = body.get("scanner")
+        regime = body.get("regime")
+        side = body.get("side")
+        if not (scanner and regime and side):
+            return web.json_response({"error": "scanner, regime, side required"}, status=400)
+
+        path = self._research_file("active_vetoes.json")
+        store = self._read_json_or_default(path, {"vetoes": [], "last_updated": None})
+        # Avoid duplicates
+        key = (scanner, regime, side)
+        already = any(
+            (v.get("scanner"), v.get("regime"), v.get("side")) == key
+            for v in store["vetoes"]
+        )
+        if already:
+            return web.json_response({"status": "already_exists"}, status=200)
+
+        store["vetoes"].append({
+            "scanner": scanner, "regime": regime, "side": side,
+            "reason": body.get("reason", "manual"),
+            "mode": body.get("mode", "shadow"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        store["last_updated"] = datetime.now(timezone.utc).isoformat()
+        self._write_json_atomic(path, store)
+        self._append_event("veto_added", {
+            "scanner": scanner, "regime": regime, "side": side,
+            "mode": body.get("mode", "shadow"),
+        })
+        return web.json_response({"status": "ok", "mode": body.get("mode", "shadow")})
+
+    async def _handle_research_vetoes_remove(self, request):
+        """POST /api/research/vetoes/remove — unfreeze a cohort by index."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+
+        idx = body.get("index")
+        if not isinstance(idx, int):
+            return web.json_response({"error": "index (int) required"}, status=400)
+
+        path = self._research_file("active_vetoes.json")
+        store = self._read_json_or_default(path, {"vetoes": [], "last_updated": None})
+        if idx < 0 or idx >= len(store["vetoes"]):
+            return web.json_response({"error": "index out of range"}, status=400)
+
+        removed = store["vetoes"].pop(idx)
+        store["last_updated"] = datetime.now(timezone.utc).isoformat()
+        self._write_json_atomic(path, store)
+        self._append_event("veto_removed", {
+            "scanner": removed.get("scanner"),
+            "regime": removed.get("regime"),
+            "side": removed.get("side"),
+        })
+        return web.json_response({"status": "ok", "removed": removed})
+
+    # -------------------------------------------------------------------
     #  Start server
     # -------------------------------------------------------------------
     async def start(self):
@@ -2112,5 +2428,16 @@ class MLDashboard:
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", self._port)
         await site.start()
+
+        # Start the Research Center background scheduler (2026-04-17)
+        try:
+            from ml_training.research_center import get_center
+            rc = get_center()
+            await rc.start()
+            logger.info("Research Center scheduler started — /api/research/* endpoints live")
+        except Exception as e:
+            logger.warning("Research Center failed to start (endpoints will fall back to live compute): %s", e)
+
         logger.info("ML Dashboard v3.0 running on http://0.0.0.0:%d", self._port)
         logger.info("  New endpoints: /api/model-trend, /api/model-health, /api/feature-drift, /api/scanner-rankings")
+        logger.info("  Research: /api/research/{cohort-health,weakspots,policy-variants,edge-trajectory,suggestions,vetoes,timeline,summary}")

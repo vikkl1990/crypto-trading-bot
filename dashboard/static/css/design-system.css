@@ -30,54 +30,63 @@
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Roboto, sans-serif;
   --font-mono: 'SF Mono', 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
 
-  /* ── Colors: Backgrounds ── */
-  --bg-base: #060d1a;
-  --bg: #0a1429;
-  --bg-card: rgba(15, 29, 50, 0.85);
-  --bg-card-alt: #111e33;
-  --bg-elevated: rgba(255, 255, 255, 0.05);
-  --bg-hover: rgba(255, 255, 255, 0.08);
-  --bg-active: rgba(255, 255, 255, 0.10);
-  --bg-glass: rgba(15, 25, 45, 0.75);
-  --bg-glass-hover: rgba(20, 35, 60, 0.85);
-  --bg-input: rgba(10, 20, 40, 0.6);
-  --bg-overlay: rgba(0, 0, 0, 0.7);
+  /* ── Colors: Backgrounds (v2 production grade — flat, no glass) ── */
+  --bg-base: #080c16;            /* canvas — slightly cooler */
+  --bg: #0a0e1a;                 /* primary */
+  --bg-card: #0f1524;            /* card — opaque, no transparency */
+  --bg-card-alt: #131a2c;
+  --bg-card-elevated: #161e34;   /* hover/selected state */
+  --bg-elevated: rgba(255, 255, 255, 0.03);
+  --bg-hover: rgba(255, 255, 255, 0.05);
+  --bg-active: rgba(255, 255, 255, 0.08);
+  --bg-glass: #0f1524;           /* legacy alias — also flat now */
+  --bg-glass-hover: #131a2c;
+  --bg-input: #060912;
+  --bg-overlay: rgba(0, 0, 0, 0.78);
 
   /* ── Colors: Text ── */
-  --text-primary: #e8ecf4;
-  --text-secondary: #9ba3b5;
-  --text-muted: #5a7090;
-  --text-dim: #3a4a60;
+  --text-primary: #e8eef9;
+  --text-secondary: #9ca8be;     /* WCAG AA: 5.6:1 on --bg */
+  --text-tertiary: #6b7794;      /* NEW — replaces overuse of --text-muted */
+  --text-muted: #6b7794;         /* alias to tertiary now */
+  --text-dim: #4a5468;
+  --text-disabled: #4a5468;
   --text: var(--text-primary);
 
-  /* ── Colors: Semantic ── */
-  --success: #00ff9d;
-  --success-hover: #33ffb3;
-  --success-dim: rgba(0, 255, 157, 0.08);
-  --success-glow: rgba(0, 255, 157, 0.25);
-  --success-border: rgba(0, 255, 157, 0.20);
+  /* ── Brand accent (v2 — single canonical) ── */
+  --accent: #00d4a8;             /* desaturated mint — quant credibility */
+  --accent-hover: #00f0bd;
+  --accent-soft: rgba(0, 212, 168, 0.10);
+  --accent-border: rgba(0, 212, 168, 0.28);
 
-  --danger: #ff3b5c;
-  --danger-hover: #ff5c78;
-  --danger-dim: rgba(255, 59, 92, 0.08);
-  --danger-glow: rgba(255, 59, 92, 0.25);
-  --danger-border: rgba(255, 59, 92, 0.20);
+  /* ── Colors: Semantic (v2 — desaturated, accessible) ── */
+  --success: #22c55e;            /* was #00ff9d (neon) — now WCAG-friendly green */
+  --success-hover: #4ade80;
+  --success-dim: rgba(34, 197, 94, 0.10);
+  --success-glow: rgba(34, 197, 94, 0.20);
+  --success-border: rgba(34, 197, 94, 0.24);
 
-  --warning: #ffd700;
-  --warning-dim: rgba(255, 215, 0, 0.08);
-  --warning-border: rgba(255, 215, 0, 0.20);
+  --danger: #ef4444;             /* was #ff3b5c — toned down */
+  --danger-hover: #f87171;
+  --danger-dim: rgba(239, 68, 68, 0.10);
+  --danger-glow: rgba(239, 68, 68, 0.22);
+  --danger-border: rgba(239, 68, 68, 0.24);
 
-  --info: #00d4ff;
-  --info-dim: rgba(0, 212, 255, 0.08);
-  --info-border: rgba(0, 212, 255, 0.20);
+  --warning: #f59e0b;            /* was #ffd700 (gold) — now amber */
+  --warning-dim: rgba(245, 158, 11, 0.10);
+  --warning-border: rgba(245, 158, 11, 0.24);
 
-  --purple: #a78bfa;
-  --purple-dim: rgba(167, 139, 250, 0.08);
-  --purple-border: rgba(167, 139, 250, 0.20);
+  --info: #38bdf8;               /* was #00d4ff (electric cyan) — sky */
+  --info-dim: rgba(56, 189, 248, 0.10);
+  --info-border: rgba(56, 189, 248, 0.24);
+
+  --purple: #a78bfa;             /* unchanged — already restrained */
+  --purple-dim: rgba(167, 139, 250, 0.10);
+  --purple-border: rgba(167, 139, 250, 0.24);
 
   --orange: #f97316;
-  --orange-dim: rgba(249, 115, 22, 0.08);
-  --orange-border: rgba(249, 115, 22, 0.20);
+  --orange-dim: rgba(249, 115, 22, 0.10);
+  --orange-border: rgba(249, 115, 22, 0.24);
 
   /* Backward compat aliases */
   --accent: var(--info);
@@ -502,4 +511,92 @@ body {
   .header, .tab-bar, .dash-footer, .site-footer { display: none !important; }
   .glass-card { border: 1px solid #999; box-shadow: none; }
   body { background: white; color: black; }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * Batch A #16: Color-blind / WCAG fix — P&L direction symbols
+ * Adds ▲/▼ arrow prefix so green/red is not the only signifier.
+ * ──────────────────────────────────────────────────────────── */
+.pnl-pos::before, .text-success::before { content: "▲ "; font-size: 0.85em; }
+.pnl-neg::before, .text-danger::before  { content: "▼ "; font-size: 0.85em; }
+.pnl-pos:empty::before, .pnl-neg:empty::before,
+.pnl-pos[data-flat]::before, .pnl-neg[data-flat]::before { content: ""; }
+
+/* ─────────────────────────────────────────────────────────────────
+ * v2 Production Grade — global hygiene (2026-04-26)
+ * Spec: docs/UX_DESIGN_SYSTEM_v2_PRODUCTION.md
+ * ──────────────────────────────────────────────────────────── */
+
+/* Tabular numerals on every number — pro requirement */
+.numeric, .stat-value, .overview-value, .pnl, .pnl-pos, .pnl-neg,
+td.num, .metric, .kpi-value, .stat-value--hero,
+[data-numeric], .font-mono {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1, "calt" 0;
+}
+
+/* Drop glassmorphism from chrome — flat is more professional */
+.tab-bar, .header, .dash-footer, .site-footer {
+  backdrop-filter: none !important;
+}
+
+/* Tighter card style — reduce neon-overload borders, add subtle inset */
+.glass-card, .panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border, rgba(255,255,255,0.06));
+  box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset;
+  backdrop-filter: none;
+}
+
+/* Hero numbers ONLY at HERO size — kill the 6-tier font chaos */
+.stat-value--hero { font-size: 1.375rem !important; font-weight: 700; line-height: 1.1; }
+.stat-value       { font-size: 0.875rem; font-weight: 500; }
+
+/* Active-state tab — subtle accent (not the cyan-yellow chaos) */
+.tab-btn.active {
+  color: var(--accent) !important;
+  border-bottom-color: var(--accent) !important;
+  background: var(--accent-soft) !important;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * Batch A #17: Light theme — DISABLED 2026-04-26 v2 production grade.
+ * Reason: 200+ inline raw-hex styles in app.js don't respect token swap,
+ * causing white page + dark cards = broken when OS is in light mode.
+ * Will re-enable AFTER Batch C #18 (inline-style codemod) is complete.
+ * Wrapped behind never-matching predicate to preserve intent.
+ * ──────────────────────────────────────────────────────────── */
+@media (prefers-color-scheme: light) and (max-width: 0) {
+  :root {
+    --bg:               #f6f8fb;
+    --bg-base:          #f6f8fb;
+    --bg-card:          #ffffff;
+    --bg-card-soft:     #f0f3f8;
+    --text:             #0f1f3d;
+    --text-primary:     #0f1f3d;
+    --text-secondary:   #2d4060;
+    --text-muted:       #5a6a82;
+    --text-dim:         #8a96a8;
+    --border:           rgba(0,0,0,0.08);
+    --border-strong:    rgba(0,0,0,0.16);
+    --green:            #00a86b;
+    --success:          #00a86b;
+    --red:              #d11936;
+    --danger:           #d11936;
+    --yellow:           #b88800;
+    --warning:          #b88800;
+    --blue:             #0d6dc7;
+    --info:             #0d6dc7;
+  }
+  body { background: var(--bg-base); color: var(--text-primary); }
+  .glass-card {
+    background: var(--bg-card);
+    border-color: var(--border);
+    box-shadow: 0 1px 3px rgba(15,31,61,0.08);
+    backdrop-filter: none;
+  }
+  .overview-strip {
+    background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(246,248,251,0.92));
+    border-bottom-color: var(--border);
+  }
 }

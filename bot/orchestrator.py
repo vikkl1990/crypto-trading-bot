@@ -119,6 +119,10 @@ class BotOrchestrator:
         self._last_balance_fetch: float = 0.0  # unix timestamp
         self._balance_fetch_interval: float = 300.0  # fetch balance every 5 min
 
+        # Kill-switch close_open listener state (Silent Failure #13 fix, 2026-04-26)
+        # Per docs/KILL_SWITCH_CLOSE_OPEN_LISTENER_v1.md
+        self._close_open_acted: bool = False
+
         # Per-symbol error counters for circuit-breaking
         self._symbol_errors: Dict[str, int] = {s: 0 for s in symbols}
         self._max_symbol_errors = config.get("bot", {}).get("max_symbol_errors", 10)
@@ -156,17 +160,35 @@ class BotOrchestrator:
             self._log.warning("BotBrain init failed (continuing without): %s", exc)
             self._brain = None
 
+        # Correlation cooldown: prevent simultaneous same-side entries on
+        # highly-correlated majors (BTC/ETH/SOL). Loss-review 2026-04-20 showed
+        # multiple same-minute pair-cluster nukes (BTC-short + ETH-short at
+        # 01:32 both −0.8R, driven by the same macro move).
+        # key: frozenset({symbol, side}) → timestamp of last entry in that group
+        # For implementation simplicity we just store the last same-side entry
+        # time per major symbol, and check cross-symbol when a new major fires.
+        self._correlation_cluster = {"BTC/USDT", "ETH/USDT", "SOL/USDT"}
+        self._correlation_cooldown_sec = 60
+        self._correlation_last_fire: dict = {}   # (symbol, side) -> epoch seconds
+        self._correlation_skipped_count = 0       # for telemetry
+
         # UserRealRegistry — per-user real trading (multi-tenant)
         self._user_registry = None
         try:
             db_pool = config.get("_db_pool")  # injected by main.py if PostgreSQL is available
+            # Phase 5.0.2 — promote to warning so init state is always
+            # visible in journald (helped diagnose "no broadcast" cases).
+            self._log.warning("REGISTRY_INIT: db_pool=%s", "present" if db_pool else "MISSING")
             if db_pool:
                 from execution.user_registry import UserRealRegistry
                 self._user_registry = UserRealRegistry(db_pool)
                 self._user_registry.set_price_feed(self)
-                self._log.info("UserRealRegistry created (per-user real trading)")
+                self._log.warning("REGISTRY_INIT: UserRealRegistry created — per-user real trading ACTIVE")
+            else:
+                self._log.warning("REGISTRY_INIT: NO db_pool in config → per-user trading DISABLED")
         except Exception as exc:
-            self._log.warning("UserRealRegistry init failed (continuing without): %s", exc)
+            import traceback as _tb
+            self._log.warning("REGISTRY_INIT: FAILED: %s\n%s", exc, _tb.format_exc())
 
     # ------------------------------------------------------------------
     # Properties
@@ -260,6 +282,9 @@ class BotOrchestrator:
             # 3c. Start WebSocket for real-time prices (reduces latency 5000ms → 100ms)
             self._delta_ws = None
             self._ws_prices: Dict[str, float] = {}
+            # Phase 4.3 diag — use warning level so init path is visible in
+            # journald without depending on logging-config propagation quirks.
+            self._log.warning("WS_INIT: _HAS_DELTA_WS=%s symbols=%d", _HAS_DELTA_WS, len(self._symbols))
             if _HAS_DELTA_WS:
                 try:
                     import os
@@ -278,35 +303,29 @@ class BotOrchestrator:
                         mode="demo" if _dry_run else "live",
                     )
                     await self._delta_ws.connect()
-                    self._log.info("DeltaWebSocket started (prices + private channels)")
+                    self._log.warning("WS_INIT: DeltaWebSocket up — mode=%s symbols=%s",
+                                       "demo" if _dry_run else "live", self._symbols[:3])
+
+                    # Phase 5.2 — verify PRODUCT_MAP against live Delta API.
+                    # Fire once per startup, off the event loop (blocking
+                    # urllib but the call takes <2s and we're still in init).
+                    try:
+                        from exchange.delta_client import validate_product_map
+                        _vmode = "demo" if _dry_run else "live"
+                        await asyncio.to_thread(validate_product_map, _vmode)
+                    except Exception as _vexc:
+                        self._log.warning("PRODUCT_MAP validator skipped: %s", _vexc)
                 except Exception as exc:
-                    self._log.warning("DeltaWebSocket failed to start: %s (falling back to REST)", exc)
+                    import traceback as _tb
+                    self._log.warning("WS_INIT: FAILED: %s — falling back to REST\n%s",
+                                       exc, _tb.format_exc())
                     self._delta_ws = None
 
-            # 3d. Start Latency Arb engine (Binance vs Delta price dislocation monitor)
+            # 3d. Latency Arb engine — DISABLED 2026-04-26 (architect strip).
+            # Original disable note: "negative edge, 2.4s latency, 0% tradeable".
+            # Engine left as None; misleading "failed to start" log removed.
+            # To re-enable: import LatencyArbEngine + reinstate the start() call.
             self._latency_arb = None
-            if _HAS_LATENCY_ARB:
-                try:
-                    self._latency_arb = None  # DISABLED: negative edge, 2.4s latency, 0% tradeable
-                    if False and LatencyArbEngine:  # keep import for future
-                        self._latency_arb = LatencyArbEngine(
-                        symbols=self._symbols,
-                        on_signal=None,  # measure-only for now
-                    )
-                    self._tasks.append(
-                        asyncio.create_task(
-                            self._latency_arb.start(measure_only=True),
-                            name="latency_arb",
-                        )
-                    )
-                    self._log.info(
-                        "LatencyArb engine started (measure_only) for %s",
-                        self._symbols,
-                    )
-                except Exception as exc:
-                    self._log.warning("LatencyArb failed to start: %s", exc)
-                    pass  # end of disabled block
-                    self._latency_arb = None
 
             # 4. Start heartbeat monitor
             await self._heartbeat.start()
@@ -426,6 +445,33 @@ class BotOrchestrator:
                 )
             )
 
+            # 8c. PATCH_L_5_22 — Shadow Signal Consumer.
+            # Bridges paper engines (liq_grab_ob_fvg, liq_sweep_htf, etc.)
+            # into the shadow execution path. Each engine writes signals to
+            # storage/shadow_signal_queue.jsonl; this consumer polls every 5s
+            # and routes to _execute_shadow per opted-in user.
+            try:
+                from bot.shadow_signal_consumer import consumer_loop as _patch_l_consumer
+
+                def _patch_l_get_user_managers():
+                    if not self._user_registry:
+                        return {}
+                    return {
+                        getattr(mgr, "user_email", "") or "?": mgr
+                        for mgr in self._user_registry._managers.values()
+                        if hasattr(mgr, "user_email")
+                    }
+
+                self._tasks.append(
+                    asyncio.create_task(
+                        _patch_l_consumer(lambda: self._user_registry),
+                        name="shadow_signal_consumer",
+                    )
+                )
+                self._log.warning("PATCH_L_5_22: shadow_signal_consumer task spawned")
+            except Exception as _patch_l_e:
+                self._log.warning("PATCH_L_5_22 consumer spawn failed: %s", _patch_l_e)
+
             # 8b. Start Supervisor watchdog (60s cycle, 120s grace)
             try:
                 from bot.supervisor import Supervisor
@@ -517,10 +563,12 @@ class BotOrchestrator:
         except Exception:
             pass
 
-        # Close WebSocket
-        if self._delta_ws:
+        # Close WebSocket — Phase 5.0.2 defensive getattr in case
+        # start() crashed before line 273 set self._delta_ws.
+        _dws = getattr(self, '_delta_ws', None)
+        if _dws:
             try:
-                await self._delta_ws.close()
+                await _dws.close()
             except Exception as _shutdown_exc:
                 self._log.debug("Shutdown cleanup: %s", _shutdown_exc)
 
@@ -762,6 +810,92 @@ class BotOrchestrator:
             except Exception as exc:
                 self._log.error("WS position close handler failed: %s", exc)
 
+    async def _kill_switch_close_all_open(self) -> tuple[int, int, list]:
+        """Force-close all open user_trades positions. Per
+        docs/KILL_SWITCH_CLOSE_OPEN_LISTENER_v1.md.
+        Returns (closed_count, failed_count, detail_list).
+
+        Shadow trades: stamp closed_at in DB with current WS price.
+        Real trades: log + skip (v1 conservative — manual close required).
+        Future v2: per-user UserRealManager.close_position_at_market().
+        """
+        closed = 0
+        failed = 0
+        detail = []
+        if not self._db_pool:
+            return 0, 0, []
+        try:
+            async with self._db_pool.acquire() as con:
+                rows = await con.fetch(
+                    """SELECT id, user_id, symbol, side, entry_price, quantity, trade_type
+                       FROM user_trades
+                       WHERE closed_at IS NULL
+                       ORDER BY opened_at"""
+                )
+            for r in rows:
+                try:
+                    sym = r["symbol"]
+                    side = r["side"]
+                    entry = float(r["entry_price"] or 0)
+                    qty = float(r["quantity"] or 0)
+                    tt = r["trade_type"]
+                    # Get current price (WS preferred)
+                    cur_px = float(self._ws_prices.get(sym, 0) or 0) if hasattr(self, "_ws_prices") else 0
+                    if cur_px <= 0:
+                        cur_px = entry  # fallback: use entry (no PnL)
+                    # Compute simple PnL (long: cur-entry; short: entry-cur)
+                    if side and side.lower() == "long":
+                        pnl = (cur_px - entry) * qty
+                    else:
+                        pnl = (entry - cur_px) * qty
+                    if tt == "real":
+                        # G3 fix (2026-04-26): use UserRealManager.close_position_at_market
+                        # for real trades — sends market_order ioc reduce_only to Delta.
+                        try:
+                            user_mgr = None
+                            if self._user_registry is not None:
+                                user_mgr = await self._user_registry.get_manager_for_user(str(r["user_id"]))
+                            if user_mgr is None:
+                                raise RuntimeError("no_user_manager_for_" + str(r["user_id"])[:8])
+                            res = await user_mgr.close_position_at_market(
+                                trade_id=str(r["id"]),
+                                reason="kill_switch_close_open",
+                            )
+                            if res.get("ok"):
+                                closed += 1
+                                detail.append({"trade_id": str(r["id"]), "type": "real",
+                                              "exit": res.get("exit_price")})
+                            else:
+                                failed += 1
+                                detail.append({"trade_id": str(r["id"]), "type": "real",
+                                              "error": res.get("error", "unknown")})
+                        except Exception as _re:
+                            failed += 1
+                            detail.append({"trade_id": str(r["id"]), "type": "real",
+                                          "error": str(_re)[:120]})
+                            self._log.error("kill_switch close_open: real close failed for %s: %s", r["id"], _re)
+                        continue
+                    # Shadow / paper: stamp closed_at in DB
+                    async with self._db_pool.acquire() as con:
+                        await con.execute(
+                            """UPDATE user_trades SET
+                                  closed_at = NOW(),
+                                  exit_price = $1,
+                                  pnl_usd = $2,
+                                  status = 'force_closed_kill_switch'
+                                WHERE id = $3""",
+                            cur_px, float(pnl), r["id"]
+                        )
+                    closed += 1
+                    detail.append({"trade_id": str(r["id"]), "type": tt, "exit": cur_px, "pnl": pnl})
+                except Exception as _re:
+                    failed += 1
+                    detail.append({"trade_id": str(r.get("id", "?")), "error": str(_re)[:120]})
+                    self._log.error("kill_switch close_open: failed %s: %s", r.get("id"), _re)
+        except Exception as _outer:
+            self._log.error("kill_switch close_open _kill_switch_close_all_open: %s", _outer, exc_info=True)
+        return closed, failed, detail
+
     async def _fast_trade_monitor_loop(self) -> None:
         """Dedicated loop for active trade monitoring.
 
@@ -788,6 +922,36 @@ class BotOrchestrator:
 
                 if not self._running:
                     continue
+
+                # ── KILL_SWITCH close_open listener (Silent Failure #13 fix) ──
+                # Fires once per engagement. Reset on release.
+                try:
+                    from execution.kill_switch import get_kill_state
+                    _ks = await get_kill_state(self._db_pool)
+                    if _ks.engaged and _ks.close_open and not self._close_open_acted:
+                        n_closed, n_failed, detail = await self._kill_switch_close_all_open()
+                        self._log.warning(
+                            "KILL_SWITCH close_open ACTED: closed=%d failed=%d reason=%s",
+                            n_closed, n_failed, _ks.reason,
+                        )
+                        # Clear flag + write audit
+                        async with self._db_pool.acquire() as _con:
+                            await _con.execute(
+                                "UPDATE bot_state SET kill_switch_close_open=FALSE WHERE id=1"
+                            )
+                            await _con.execute(
+                                """INSERT INTO kill_switch_close_audit
+                                      (triggered_by, reason, positions_closed, positions_failed, detail)
+                                   VALUES ($1, $2, $3, $4, $5::jsonb)""",
+                                _ks.engaged_by or "unknown", _ks.reason or "",
+                                n_closed, n_failed,
+                                __import__("json").dumps(detail),
+                            )
+                        self._close_open_acted = True
+                    elif not _ks.engaged:
+                        self._close_open_acted = False  # reset for next engagement
+                except Exception as _kse:
+                    self._log.debug("kill_switch close_open listener tick failed: %s", _kse)
 
                 # ── PERIODIC ORPHAN SYNC ──
                 # IMPORTANT: Runs AFTER event processing (below) to give mirror_paper_exit
@@ -1722,6 +1886,43 @@ class BotOrchestrator:
             _tracker_active_before = len(getattr(self._signal_tracker, '_active', {}) or {})
         except Exception:
             _tracker_active_before = -1  # disable orphan check on lookup failure
+
+        # ── Correlation cooldown: block same-side entries on correlated
+        # majors fired within the cooldown window (2026-04-20 loss-review
+        # finding: BTC/ETH/SOL same-side same-minute = correlated disaster).
+        # Check happens JUST before track_signal. Skipped signals are logged
+        # to the funnel so Research Lab can count/attribute them.
+        try:
+            _sym = sig_dict.get("symbol") or symbol
+            _side = str(sig_dict.get("side") or "").lower()
+            if _sym in self._correlation_cluster and _side in ("long", "short"):
+                import time as _time
+                now_sec = _time.time()
+                # Check each OTHER major in the cluster for a recent same-side fire
+                blocker = None
+                for other in self._correlation_cluster:
+                    if other == _sym:
+                        continue
+                    last = self._correlation_last_fire.get((other, _side), 0.0)
+                    age = now_sec - last
+                    if age < self._correlation_cooldown_sec:
+                        blocker = (other, int(self._correlation_cooldown_sec - age))
+                        break
+                if blocker:
+                    other_sym, remaining = blocker
+                    self._correlation_skipped_count += 1
+                    self._log.info(
+                        "CORRELATION COOLDOWN: skip %s %s (same-side %s fired %ds ago; %ds remaining)",
+                        _sym, _side, other_sym,
+                        int(self._correlation_cooldown_sec - remaining), remaining,
+                    )
+                    return  # drop this signal — don't track, don't broadcast
+                # Record this fire for the cooldown check on subsequent majors
+                self._correlation_last_fire[(_sym, _side)] = now_sec
+        except Exception as _exc:
+            # Cooldown gate must never break trading; fail-open on errors
+            self._log.debug("correlation cooldown check failed: %s", _exc)
+
         try:
             # Pass order_type so from_signal can compute fees correctly
             sig_dict["_order_type"] = getattr(self._signal_tracker, "_order_type", "maker")
@@ -1857,9 +2058,28 @@ class BotOrchestrator:
         if self._user_registry:
             try:
                 import asyncio
+                # 2026-04-27 BROADCAST trace: enables clean accounting of how
+                # many paper signals reach the broadcast layer vs how many die
+                # in upstream filters (decision_engine WAIT, signal_tracker
+                # grade/conf/fee gates, paper_engine execute() failures).
+                # Pair with QUALIFY_REJECT (per-user gate) and SHADOW ENTRY
+                # (per-user accept) to see full conversion funnel.
+                _meta = sig_dict.get("metadata", {}) or {}
+                self._log.warning(
+                    "BROADCAST: %s %s grade=%s conf=%s ml=%s regime=%s scanner=%s",
+                    symbol,
+                    str(sig_dict.get("side", "?")).lower(),
+                    sig_dict.get("grade", "-"),
+                    sig_dict.get("confidence", "-"),
+                    _meta.get("ml_probability", "-"),
+                    _meta.get("regime", "-"),
+                    _meta.get("scanner", "-"),
+                )
                 asyncio.create_task(self._user_registry.broadcast_signal(sig_dict))
             except Exception as exc:
-                self._log.debug("User registry broadcast failed: %s", exc)
+                # 2026-04-27 promote from debug→warning so silent failures here
+                # are visible (this was a hidden death point for shadow signals)
+                self._log.warning("BROADCAST_FAIL: %s %s — %s", symbol, signal_type, exc)
 
         # -- Journal --
         try:

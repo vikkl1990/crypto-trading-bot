@@ -533,3 +533,52 @@ def detect_choch(
             }
 
     return result
+
+
+def calc_stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3, smooth: int = 3) -> pd.DataFrame:
+    """Stochastic Oscillator (14,3,3).
+    
+    Returns DataFrame with columns: stoch_k, stoch_d
+    """
+    low_min = df["low"].rolling(window=k_period).min()
+    high_max = df["high"].rolling(window=k_period).max()
+    
+    # Fast %K
+    fast_k = ((df["close"] - low_min) / (high_max - low_min)) * 100
+    fast_k = fast_k.fillna(50)
+    
+    # Slow %K (smoothed)
+    stoch_k = fast_k.rolling(window=smooth).mean()
+    
+    # %D (signal line)
+    stoch_d = stoch_k.rolling(window=d_period).mean()
+    
+    result = pd.DataFrame(index=df.index)
+    result["stoch_k"] = stoch_k
+    result["stoch_d"] = stoch_d
+    return result
+
+
+def calc_obv(df: pd.DataFrame) -> pd.Series:
+    """On-Balance Volume (OBV).
+    
+    Returns cumulative OBV series.
+    """
+    import numpy as np
+    direction = np.where(df["close"] > df["close"].shift(1), 1,
+                np.where(df["close"] < df["close"].shift(1), -1, 0))
+    obv = (direction * df["volume"]).cumsum()
+    return obv
+
+
+def calc_obv_slope(df: pd.DataFrame, lookback: int = 10) -> pd.Series:
+    """OBV slope over lookback bars (normalized by volume SMA).
+    
+    Positive = accumulation, Negative = distribution.
+    """
+    obv = calc_obv(df)
+    vol_sma = df["volume"].rolling(lookback).mean()
+    obv_change = obv - obv.shift(lookback)
+    # Normalize by volume SMA to make it comparable across symbols
+    slope = obv_change / vol_sma.where(vol_sma > 0, 1)
+    return slope

@@ -64,6 +64,21 @@ _TEMPLATES_DIR = _DASHBOARD_DIR / "templates"
 _STATIC_DIR = _DASHBOARD_DIR / "static"
 
 
+def _bust(static_dir, relpath: str) -> str:
+    """Append ?v=<mtime> to a static file path so browsers pick up new
+    versions automatically. If the path already has a query string or the
+    file can't be stat'd, return it unchanged.
+    """
+    if '?' in relpath:
+        return relpath
+    try:
+        p = static_dir / relpath
+        mtime = int(p.stat().st_mtime)
+        return f"{relpath}?v={mtime}"
+    except Exception:
+        return relpath
+
+
 class DashboardServer:
     """Async web dashboard that exposes bot state via HTTP.
 
@@ -77,10 +92,17 @@ class DashboardServer:
     _MAX_PERSISTED = 200  # keep last 200 signals on disk
 
     # Auth: public paths that don't require login (read-only, no sensitive data)
+    # SEC FIX (2026-04-16): removed /api/real/status, /api/real/trades,
+    # /api/risk-metrics, /api/session-heatmap from public paths. These were
+    # exposing live balance, equity, PnL, trade history, and performance
+    # metrics to unauthenticated callers — anyone who could reach :8080
+    # could see the full portfolio. Now require auth.
+    #
+    # Kept public: /api/login (bootstrap), /api/ping (liveness probe),
+    # /api/emergency-status (read-only kill-switch state),
+    # /favicon.ico (browser default).
     _PUBLIC_PATHS = {
         "/api/login", "/api/ping", "/favicon.ico",
-        "/api/real/status", "/api/real/trades",
-        "/api/risk-metrics", "/api/session-heatmap",
         "/api/emergency-status",
     }
     _PUBLIC_PREFIXES = ("/static/",)
@@ -149,14 +171,43 @@ class DashboardServer:
         # Auth config — ALWAYS enabled, generate random password if not set
         self._auth_user = os.getenv("DASHBOARD_USER", "admin")
         self._auth_password = os.getenv("DASHBOARD_PASSWORD", "")
-        self._auth_secret = os.getenv("DASHBOARD_SECRET_KEY", secrets.token_hex(32))
+        _raw_secret = os.getenv("DASHBOARD_SECRET_KEY", "")
+
+        # SEC FIX (2026-04-16): fail fast on placeholder or missing secret.
+        # Previously the code used secrets.token_hex(32) as a fallback which
+        # meant every process restart generated a NEW key, invalidating all
+        # existing session cookies. If operators set the literal string
+        # "change-this-to-a-random-string" they got session-token forgery
+        # via a known-value signature. Now we reject both cases loudly.
+        _PLACEHOLDERS = {
+            "", "change-this-to-a-random-string", "changeme", "your-secret-key",
+            "example-secret", "placeholder",
+        }
+        if _raw_secret.strip().lower() in _PLACEHOLDERS:
+            _generated = secrets.token_hex(32)
+            logger.critical(
+                "DASHBOARD_SECRET_KEY is unset or still a placeholder. Generated "
+                "an ephemeral 64-char key for this process only. Session cookies "
+                "will be invalidated on next restart. Set a permanent value in "
+                ".env: DASHBOARD_SECRET_KEY=%s", _generated[:16] + "...",
+            )
+            self._auth_secret = _generated
+        else:
+            self._auth_secret = _raw_secret
+
         if not self._auth_password:
             self._auth_password = secrets.token_hex(16)
             logger.warning("DASHBOARD_PASSWORD not set — generated random password (check .env to set a permanent one)")
         self._auth_enabled = True  # always enabled
         self._sessions: Dict[str, Dict[str, Any]] = {}  # token -> session data
         self._session_history: List[Dict[str, Any]] = []  # login history
-        self._session_timeout = 86400  # 24 hours
+        # SEC FIX (2026-04-16): reduce session timeout from 24h to 4h.
+        # A stolen cookie was valid for a full day — standard for financial
+        # apps is 1-4h. Sliding extension (resets on each authed request) is
+        # handled at cookie-emit time in _handle_login; we also refresh on
+        # verify for active users.
+        self._session_timeout = 4 * 3600  # 4 hours
+        self._session_idle_limit = 30 * 60  # 30min idle → re-auth required
         self._emergency_stop = False  # kill switch state
 
         # aiohttp internals
@@ -415,18 +466,27 @@ class DashboardServer:
                 "full_name": session.get("full_name", ""),
             }
 
-        # Allow ALL GET/HEAD requests (read-only dashboard data)
-        if method in ("GET", "HEAD"):
+        # SEC FIX (2026-04-16): previously allowed ALL GET/HEAD through
+        # without auth ("read-only dashboard data"). But /api/real/status,
+        # /api/real/trades, /api/risk-metrics are GET endpoints that leak
+        # balance, position history, and performance metrics. Removing them
+        # from _PUBLIC_PATHS didn't help because of this blanket rule.
+        #
+        # New policy: auth required for ALL /api/* endpoints except the
+        # ones explicitly in _PUBLIC_PATHS (login, ping, emergency-status).
+        # Non-API paths (HTML/static) still allow GET without auth so the
+        # login page itself loads.
+        if method in ("GET", "HEAD") and not path.startswith("/api/"):
             return await handler(request)
 
-        # POST requests: require auth (state-changing operations)
+        # /api/* — auth required (except bootstrap paths)
         if path in ("/api/login", "/api/logout", "/api/register"):
             return await handler(request)
 
         if session:
             return await handler(request)
 
-        # Not authenticated for POST
+        # Not authenticated — deny
         if path.startswith("/api/"):
             return web.json_response({"error": "unauthorized"}, status=401)
 
@@ -434,17 +494,56 @@ class DashboardServer:
         return await handler(request)
 
     async def _handle_login(self, request: web.Request) -> web.Response:
-        """POST /api/login — validate credentials, set session cookie."""
+        """POST /api/login — validate credentials, set session cookie.
+
+        SEC FIX (2026-04-16): IP-based brute-force protection.
+        - 5 failed attempts within 60s → 15-min lockout for that IP
+        - Lockout state stored in self._login_failures (ephemeral, per-process)
+        - Successful login clears the counter
+        """
+        # Initialize lockout tracker on first call
+        if not hasattr(self, "_login_failures"):
+            self._login_failures: Dict[str, List[float]] = {}
+            self._login_lockouts: Dict[str, float] = {}
+
+        ip = request.remote or "unknown"
+        now = time.time()
+
+        # Check active lockout
+        lockout_until = self._login_lockouts.get(ip, 0.0)
+        if now < lockout_until:
+            remaining = int(lockout_until - now)
+            logger.warning("Login lockout for IP %s (%ds remaining)", ip, remaining)
+            return web.json_response(
+                {"error": f"Too many failed attempts. Try again in {remaining}s."},
+                status=429,
+            )
+
         try:
             body = await request.json()
         except Exception:
             return web.json_response({"error": "invalid JSON"}, status=400)
         user = body.get("username", "")
         password = body.get("password", "")
-        logger.info("LOGIN DEBUG: received user=[%s] pwd_len=%d, expected user=[%s] pwd_len=%d, match_user=%s match_pwd=%s",
-                   user, len(password), self._auth_user, len(self._auth_password),
-                   user == self._auth_user, password == self._auth_password)
+        # SEC FIX (2026-04-16): removed "LOGIN DEBUG" log that leaked pwd_len,
+        # expected username, and match booleans. A log-viewer or aggregator
+        # could enumerate valid users by watching match_user=True patterns.
         if user != self._auth_user or password != self._auth_password:
+            # Record failure + possibly lock out
+            attempts = self._login_failures.setdefault(ip, [])
+            attempts.append(now)
+            # Prune attempts older than 60s
+            self._login_failures[ip] = [t for t in attempts if now - t < 60]
+            if len(self._login_failures[ip]) >= 5:
+                self._login_lockouts[ip] = now + 900  # 15-min lockout
+                self._login_failures[ip] = []
+                logger.warning(
+                    "IP %s exceeded 5 failed logins in 60s — locked out for 15min", ip,
+                )
+                return web.json_response(
+                    {"error": "Too many failed attempts. IP locked for 15 minutes."},
+                    status=429,
+                )
             logger.warning("Failed login attempt from %s (user=%s)", request.remote, user)
             self._session_history.append({
                 "user": user, "ip": request.remote,
@@ -452,6 +551,10 @@ class DashboardServer:
                 "success": False,
             })
             return web.json_response({"error": "invalid credentials"}, status=401)
+
+        # Success — clear any failure history for this IP
+        self._login_failures.pop(ip, None)
+        self._login_lockouts.pop(ip, None)
         # Create session
         token = secrets.token_hex(32)
         sig = self._sign_token(token)
@@ -548,17 +651,60 @@ class DashboardServer:
         if self._auth_service and self._db_pool:
             from dashboard.user_routes import register_user_routes
             from dashboard.admin_routes import register_admin_routes
+            from dashboard.profile_routes import register_profile_routes
             register_user_routes(self._app, self._auth_service, self._db_pool)
             register_admin_routes(self._app, self._auth_service, self._db_pool)
-            logger.info("Multi-user routes registered (user profile, API keys, admin)")
+            register_profile_routes(self._app, self._auth_service, self._db_pool)
+            logger.info("Multi-user routes registered (user profile, API keys, admin, self-service profile)")
 
-            # Per-user real trading routes
-            orch = getattr(self, '_orchestrator', None)
-            user_registry = getattr(orch, '_user_registry', None) if orch else None
-            if user_registry:
-                from dashboard.user_trading_routes import register_user_trading_routes
-                register_user_trading_routes(self._app, user_registry, self._db_pool)
-                logger.info("Per-user trading routes registered (8 endpoints)")
+            # Per-user real trading routes.
+            # BUGFIX 2026-04-21: routes were being skipped here because
+            # self._orchestrator hasn't been assigned yet at this point
+            # (main.py wires the orchestrator AFTER dashboard.start()).
+            # Authenticated browsers hitting /api/user/real/toggle then got
+            # 404 Not Found (middleware passes auth, router has no match).
+            # Fix: register routes UNCONDITIONALLY, using a lazy proxy that
+            # resolves user_registry at REQUEST time from self._orchestrator.
+            # If orchestrator is still None at request time, the proxy raises
+            # a clean RuntimeError that handlers can translate to 503.
+            class _LazyUserRegistry:
+                """Late-binding proxy — resolves the real UserRealRegistry
+                each time an attribute is accessed."""
+                def __init__(self, dashboard_ref):
+                    self._dash = dashboard_ref
+                def _resolve(self):
+                    orch = getattr(self._dash, '_orchestrator', None)
+                    return getattr(orch, '_user_registry', None) if orch else None
+                def __getattr__(self, name):
+                    target = self._resolve()
+                    if target is None:
+                        raise RuntimeError(
+                            "user_registry not yet initialized — orchestrator "
+                            "still booting. Retry in a few seconds."
+                        )
+                    return getattr(target, name)
+                def __bool__(self):
+                    return self._resolve() is not None
+                @property
+                def _managers(self):
+                    target = self._resolve()
+                    if target is None:
+                        return {}  # empty dict so `if user_id in _managers` is False
+                    return target._managers
+                @property
+                def _last_user_refresh(self):
+                    target = self._resolve()
+                    return getattr(target, '_last_user_refresh', 0) if target else 0
+                @_last_user_refresh.setter
+                def _last_user_refresh(self, value):
+                    target = self._resolve()
+                    if target:
+                        target._last_user_refresh = value
+
+            from dashboard.user_trading_routes import register_user_trading_routes
+            lazy_registry = _LazyUserRegistry(self)
+            register_user_trading_routes(self._app, lazy_registry, self._db_pool)
+            logger.info("Per-user trading routes registered (lazy-bound — resolves at request time)")
 
             # Replay + attribution routes
             try:
@@ -627,6 +773,8 @@ class DashboardServer:
 
         # Pages
         app.router.add_get("/", self._handle_index)
+        app.router.add_get("/admin", self._handle_admin_panel)  # production admin panel (2026-04-19)
+        app.router.add_get("/profile", self._handle_profile_page)  # production profile page (2026-04-19)
 
         # JSON API
         app.router.add_get("/api/status", self._handle_status)
@@ -635,6 +783,49 @@ class DashboardServer:
         app.router.add_get("/api/trades", self._handle_trades)
         app.router.add_get("/api/performance", self._handle_performance)
         app.router.add_get("/api/alerts", self._handle_alerts)
+        # Architect's Overview Strip — Agent 14 UX P0 #1 (B3, 2026-04-26)
+        app.router.add_get("/api/overview", self._handle_overview)
+        # Batch B #7: per-symbol/per-user maker drill-down (2026-04-26)
+        app.router.add_get("/api/maker-stats", self._handle_maker_stats)
+        # Co-pilot Sprint 1 MVP: queue + action endpoints (2026-04-26)
+        app.router.add_get("/api/copilot/queue", self._handle_copilot_queue)
+        app.router.add_post("/api/copilot/action", self._handle_copilot_action)
+        # Phase 3 quant heroes — Sharpe/Sortino/MaxDD/PF (2026-04-26)
+        app.router.add_get("/api/quant-metrics", self._handle_quant_metrics)
+        # Exchange Compare — Delta India vs Bybit (2026-04-26)
+        app.router.add_get("/api/exchange-comparison", self._handle_exchange_comparison)
+        # Multi-exchange overview — per-exchange active + last + today (2026-04-26)
+        app.router.add_get("/api/multi-exchange/overview", self._handle_multi_exchange_overview)
+        # Multi-exchange closed trades by bucket — for Analytics Trade History 4-tab (2026-04-26)
+        app.router.add_get("/api/multi-exchange/closed",   self._handle_multi_exchange_closed)
+        # Unified Paper + Shadow API family (2026-04-26) — clean per-mode endpoints
+        app.router.add_get("/api/paper/active",   self._handle_paper_active)
+        app.router.add_get("/api/paper/closed",   self._handle_paper_closed)
+        app.router.add_get("/api/paper/stats",    self._handle_paper_stats)
+        app.router.add_get("/api/shadow/exchanges", self._handle_shadow_exchanges)
+        app.router.add_get("/api/shadow/active",  self._handle_shadow_active)
+        app.router.add_get("/api/shadow/closed",  self._handle_shadow_closed)
+        app.router.add_get("/api/shadow/stats",   self._handle_shadow_stats)
+
+        # Phase 2 Shadow-of-Shadow leaderboard (2026-04-27) — fan-out exit
+        # config A/B/C/D/E. Aggregates per exit_config_id over the window.
+        app.router.add_get("/api/phase2/leaderboard", self._handle_phase2_leaderboard)
+
+        # Agents TEAM status (2026-04-27) — live fire times + last output
+        # for the 14-agent operational team + Tier A/B workers + specialty
+        # crons. Renamed to /team because /api/agents/status was already
+        # taken by the ML-models legacy endpoint at line ~3776.
+        app.router.add_get("/api/agents/team", self._handle_agents_team)
+
+        # Maker counterfactual analytics (2026-04-27 Path A) — what would
+        # shadow PnL look like if patient-mode maker fills worked? Reads
+        # cf_maker_savings_* fields stamped into close_meta by _close_shadow.
+        app.router.add_get("/api/maker/counterfactual", self._handle_maker_counterfactual)
+
+        # Chief Quant continuous briefing (2026-04-28) — meta-agent that
+        # aggregates all other agents into one decision-grade markdown
+        # every 30 min. Endpoint serves the latest.md as plain text.
+        app.router.add_get("/api/chief-quant/latest", self._handle_chief_quant_latest)
 
         # Signal tracker stats
         app.router.add_get("/api/tracker/stats", self._handle_tracker_stats)
@@ -664,6 +855,14 @@ class DashboardServer:
         app.router.add_get("/health", self._handle_health_check)
         app.router.add_get("/api/csrf", self._handle_csrf_token)
         app.router.add_get("/api/latency", self._handle_latency)
+
+        # Phase 5.17 — PPP dashboard panel API
+        try:
+            from dashboard.ppp_api import make_ppp_handler
+            app.router.add_get("/api/ppp", make_ppp_handler(self._db_pool))
+        except Exception as _e:
+            import logging as _log
+            _log.getLogger("dashboard").warning("PPP api wiring failed: %s", _e)
         app.router.add_get("/api/latency-arb", self._handle_latency_arb)
         app.router.add_get("/api/latency-arb/dislocations", self._handle_latency_arb_dislocations)
         app.router.add_get("/api/latency-arb/analysis", self._handle_latency_arb_analysis)
@@ -757,11 +956,63 @@ class DashboardServer:
         index_path = _TEMPLATES_DIR / "index.html"
         if not index_path.exists():
             return web.Response(text="Dashboard template not found", status=500)
-        if True:  # always reload template (cache was serving stale login form)
-            self._idx_cache = index_path.read_text(encoding="utf-8")
+        html = index_path.read_text(encoding="utf-8")
+        # Cache-bust static JS/CSS by rewriting the href/src to include
+        # the file's mtime. Prevents the class of bugs where we push a new
+        # app.js and users keep seeing old cached versions (404s on new
+        # endpoints, missing new functions, etc.). (2026-04-19)
+        html = self._bust_static_refs(html)
+        self._idx_cache = html
         return web.Response(
             text=self._idx_cache, content_type="text/html",
             headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"},
+        )
+
+    def _bust_static_refs(self, html: str) -> str:
+        """Rewrite /static/js/foo.js → /static/js/foo.js?v=<mtime> so the
+        browser always refetches when the file changes on disk. Covers
+        both <script src="..."> and <link href="..."> references."""
+        import re
+        static_dir = _STATIC_DIR
+        html = re.sub(
+            r'src="/static/([^"?]+)"',
+            lambda m: f'src="/static/{_bust(static_dir, m.group(1))}"',
+            html,
+        )
+        html = re.sub(
+            r'href="/static/([^"?]+)"',
+            lambda m: f'href="/static/{_bust(static_dir, m.group(1))}"',
+            html,
+        )
+        return html
+
+    async def _handle_profile_page(self, request: web.Request) -> web.Response:
+        """GET /profile — production user profile page HTML."""
+        profile_path = _TEMPLATES_DIR / "profile_page.html"
+        if not profile_path.exists():
+            return web.Response(text="Profile page template not found", status=500)
+        body = self._bust_static_refs(profile_path.read_text(encoding="utf-8"))
+        return web.Response(
+            text=body, content_type="text/html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+
+    async def _handle_admin_panel(self, request: web.Request) -> web.Response:
+        """GET /admin — production admin panel HTML.
+
+        The middleware ensures the caller is authenticated. Role enforcement
+        (admin only) is done CLIENT-SIDE via /api/session check in the JS bundle,
+        AND SERVER-SIDE via require_role('admin') on every /api/admin/* handler.
+        Non-admin users who hit /admin will see the UI shell load but the first
+        /api/admin/system-stats fetch returns 403, and the JS redirects to /.
+        """
+        admin_path = _TEMPLATES_DIR / "admin_panel.html"
+        if not admin_path.exists():
+            return web.Response(text="Admin panel template not found", status=500)
+        body = self._bust_static_refs(admin_path.read_text(encoding="utf-8"))
+        return web.Response(
+            text=body, content_type="text/html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
         )
 
     async def _handle_status(self, request: web.Request) -> web.Response:
@@ -797,6 +1048,1587 @@ class DashboardServer:
                 data["setup_candidates"] = []
 
         return web.json_response(data, dumps=_safe_dumps)
+
+    async def _handle_overview(self, request: web.Request) -> web.Response:
+        """Architect's Overview Strip — single endpoint that aggregates
+        STATE / LAST / NEXT / BOOK / EDGE / MAKER for the sticky top strip.
+        Agent 14 UX P0 #1 (B3 variant, 2026-04-26).
+        Spec: docs/UX_OVERVIEW_STRIP_v1.md
+        """
+        out = {
+            "state": "unknown",
+            "mode": "",
+            "last": {},
+            "next": {},
+            "book": {"open": 0, "paper": 0, "real": 0, "shadow": 0, "cap_deployed": 0.0},
+            "edge": {"wr_pct": None, "pf": None, "pnl_24h": None},
+            "maker": {"fill_rate_pct": None, "n": 0, "last_at": None},
+            "alerts": [],
+            "ts": datetime.utcnow().isoformat() + "Z",
+        }
+        if not self._db_pool:
+            out["error"] = "db_pool_not_ready"
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            async with self._db_pool.acquire() as con:
+                # 1. STATE — derive from active user mode mix
+                modes = await con.fetch(
+                    "SELECT bot_mode, COUNT(*) AS n FROM users WHERE is_active=true GROUP BY bot_mode"
+                )
+                mode_summary = {r["bot_mode"]: r["n"] for r in modes}
+                if mode_summary.get("live", 0) > 0:
+                    out["state"] = "trading"
+                    out["mode"] = "live+"
+                elif mode_summary.get("shadow_live", 0) > 0:
+                    # 2026-04-27 — was 'paused' (semantically true: no live money)
+                    # but visually misleading: shadow trading IS happening, fills
+                    # are simulated against real L2. Surface as 'shadow' so the
+                    # operator sees activity is live, just not on real capital.
+                    out["state"] = "shadow"
+                    out["mode"] = "shadow_live"
+                else:
+                    out["state"] = "trading"
+                    out["mode"] = "paper"
+
+                # 2. LAST — most recent closed trade across all users + modes
+                # Note: schema has no risk_usd column — show raw P&L instead of R-multiple.
+                row = await con.fetchrow(
+                    """SELECT symbol, side,
+                              pnl_usd::float AS pnl,
+                              closed_at,
+                              COALESCE(metadata::jsonb->>'scanner', '') AS scanner
+                       FROM user_trades
+                       WHERE closed_at IS NOT NULL
+                       ORDER BY closed_at DESC LIMIT 1"""
+                )
+                if row:
+                    out["last"] = {
+                        "symbol": row["symbol"], "side": row["side"],
+                        "pnl": float(row["pnl"]) if row["pnl"] is not None else None,
+                        # asyncpg datetimes are tz-aware — isoformat() already includes +00:00 offset.
+                        # Do NOT append "Z" (would produce invalid ISO 8601 → JS Date NaN).
+                        "closed_at": row["closed_at"].isoformat() if row["closed_at"] else None,
+                        "scanner": row["scanner"] or "",
+                    }
+
+                # 3. BOOK — counts + capital deployed (currently open)
+                # 2026-04-26: cap_deployed must be CONTRACT-AWARE.
+                # Delta India qty is in CONTRACTS where contract_size != 1
+                # (e.g. BTC contract = 0.001 BTC). Old SUM(entry*qty) returned
+                # raw contract-units × USD price → +$2.3M phantom number.
+                # Now: sum(margin) when available (already net of contract size
+                # and leverage), else fall back to entry × qty × contract_size.
+                booka = await con.fetch(
+                    """SELECT trade_type, COUNT(*) AS n,
+                              COALESCE(
+                                SUM(
+                                  COALESCE(NULLIF(metadata::jsonb->>'margin','')::float,
+                                           entry_price * quantity *
+                                           COALESCE(NULLIF(metadata::jsonb->>'contract_size','')::float, 1.0)
+                                  )
+                                ), 0
+                              )::float AS cap
+                       FROM user_trades
+                       WHERE closed_at IS NULL
+                       GROUP BY trade_type"""
+                )
+                for r in booka:
+                    tt = r["trade_type"]
+                    if tt in out["book"]:
+                        out["book"][tt] = r["n"]
+                    out["book"]["open"] += r["n"]
+                    out["book"]["cap_deployed"] += r["cap"]
+
+                # 4. EDGE — 24h aggregate, scoped to the OPERATOR-RELEVANT cohort.
+                # 2026-04-27: was an "all trade types mixed" headline that hid the
+                # real story (shadow profitable, real bleeding, demo flat). Now
+                # follow the bot_mode of the active user(s):
+                #   live+        → real     (the money number)
+                #   shadow_live  → shadow   (the canonical edge tracker)
+                #   paper        → paper proxy (closed_signals.json — n/a here)
+                # Plus the same clean filter as /api/quant-metrics: excludes
+                # auto_responder_stuck_60m + is_phase2_virtual rows.
+                _edge_type = "real" if mode_summary.get("live", 0) > 0 \
+                    else ("shadow" if mode_summary.get("shadow_live", 0) > 0 else None)
+                _edge_type_filter = ""
+                _edge_params = []
+                if _edge_type:
+                    _edge_type_filter = "AND trade_type = $1"
+                    _edge_params.append(_edge_type)
+                ed = await con.fetchrow(
+                    f"""SELECT COUNT(*) AS n,
+                              SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                              SUM(CASE WHEN pnl_usd > 0 THEN pnl_usd ELSE 0 END) AS gross_w,
+                              SUM(CASE WHEN pnl_usd < 0 THEN -pnl_usd ELSE 0 END) AS gross_l,
+                              SUM(pnl_usd)::float AS pnl_total
+                       FROM user_trades
+                       WHERE closed_at >= NOW() - INTERVAL '24 hours'
+                         {_edge_type_filter}
+                         AND COALESCE(metadata::jsonb->>'exit_reason', '')
+                                NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close')
+                         AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') != 'true'
+                                     OR COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary')""",
+                    *_edge_params,
+                )
+                if ed and ed["n"]:
+                    wr = (float(ed["wins"]) / float(ed["n"])) * 100.0 if ed["n"] else None
+                    pf = (float(ed["gross_w"]) / float(ed["gross_l"])) if ed["gross_l"] and float(ed["gross_l"]) > 0 else None
+                    out["edge"] = {
+                        "wr_pct": wr,
+                        "pf": pf,
+                        "pnl_24h": float(ed["pnl_total"]) if ed["pnl_total"] is not None else None,
+                    }
+
+                # 6. MAKER — 24h fill rate from real-mode entries (B3 addition)
+                mk = await con.fetchrow(
+                    """SELECT COUNT(*) AS n,
+                              SUM(CASE WHEN COALESCE(metadata::jsonb->>'fee_type','') = 'maker'
+                                       THEN 1 ELSE 0 END) AS makers,
+                              MAX(opened_at) AS last_at
+                       FROM user_trades
+                       WHERE trade_type = 'real'
+                         AND opened_at >= NOW() - INTERVAL '24 hours'"""
+                )
+                if mk and mk["n"] and mk["n"] > 0:
+                    n = int(mk["n"])
+                    makers = int(mk["makers"] or 0)
+                    out["maker"] = {
+                        "fill_rate_pct": (makers / n) * 100.0,
+                        "n": n,
+                        "last_at": mk["last_at"].isoformat() if mk["last_at"] else None,
+                    }
+                else:
+                    out["maker"] = {"fill_rate_pct": None, "n": 0, "last_at": None}
+
+            # 5. NEXT — wired 2026-04-26 per docs/NEXT_CELL_EVENT_BUS_v1.md
+            # Pulls highest-confidence FORMING setup from strategy lifecycle.
+            try:
+                strat = getattr(self, "_strategy", None)
+                if strat and hasattr(strat, "get_setup_lifecycle"):
+                    lc = strat.get_setup_lifecycle()
+                    forming = [c for c in (lc.get("candidates") or [])
+                               if str(c.get("stage", "")).lower() in ("watching", "forming", "armed_pending")]
+                    forming.sort(key=lambda c: float(c.get("confidence", 0) or 0), reverse=True)
+                    if forming:
+                        top = forming[0]
+                        conf_raw = float(top.get("confidence", 0) or 0)
+                        conf_norm = conf_raw / 100.0 if conf_raw > 1 else conf_raw
+                        out["next"] = {
+                            "symbol": top.get("symbol"),
+                            "side": top.get("side"),
+                            "conf": conf_norm,
+                            "eta_min": top.get("eta_min"),
+                        }
+            except Exception:
+                pass
+
+            # 6b. SECONDARY status row (Phase 2: replaces info from killed legacy strips)
+            try:
+                async with self._db_pool.acquire() as con3:
+                    # Kill switch state from bot_state
+                    ksrow = await con3.fetchrow(
+                        "SELECT kill_switch_engaged, kill_switch_reason, "
+                        "kill_switch_engaged_at FROM bot_state WHERE id=1"
+                    )
+                    # 24h activity counters
+                    act = await con3.fetchrow(
+                        """SELECT
+                              SUM(CASE WHEN opened_at >= NOW() - INTERVAL '24 hours' THEN 1 ELSE 0 END) AS opens24,
+                              SUM(CASE WHEN closed_at >= NOW() - INTERVAL '24 hours' THEN 1 ELSE 0 END) AS closes24,
+                              SUM(CASE WHEN opened_at >= NOW() - INTERVAL '1 hour' THEN 1 ELSE 0 END) AS opens1h
+                           FROM user_trades"""
+                    )
+                    # Unacked alerts count
+                    ack = await con3.fetchrow(
+                        "SELECT COUNT(*) AS n FROM auto_revert_events "
+                        "WHERE acknowledged=FALSE AND event_at >= NOW() - INTERVAL '24 hours'"
+                    )
+                out["secondary"] = {
+                    "kill_switch": {
+                        "engaged": bool(ksrow and ksrow["kill_switch_engaged"]),
+                        "reason": (ksrow["kill_switch_reason"] if ksrow else None) or "",
+                        "engaged_at": ksrow["kill_switch_engaged_at"].isoformat()
+                                      if ksrow and ksrow["kill_switch_engaged_at"] else None,
+                    },
+                    "activity": {
+                        "opens_1h": int(act["opens1h"] or 0) if act else 0,
+                        "opens_24h": int(act["opens24"] or 0) if act else 0,
+                        "closes_24h": int(act["closes24"] or 0) if act else 0,
+                    },
+                    "alerts_unacked_24h": int(ack["n"] or 0) if ack else 0,
+                }
+            except Exception:
+                pass
+
+            # 7. ALERTS — auto_revert_events from last 60 min (Architect-call #14)
+            try:
+                async with self._db_pool.acquire() as con2:
+                    alerts = await con2.fetch(
+                        """SELECT event_type, severity, title, event_at
+                           FROM auto_revert_events
+                           WHERE event_at >= NOW() - INTERVAL '60 minutes'
+                             AND acknowledged = FALSE
+                           ORDER BY event_at DESC LIMIT 5"""
+                    )
+                    sev_emoji = {"critical": "\U0001F534", "error": "\U0001F534",
+                                 "warn": "\u26A0", "info": "\u2139", "ok": "\u2705"}
+                    for a in alerts:
+                        out["alerts"].append({
+                            "type": a["event_type"],
+                            "severity": a["severity"],
+                            "msg": f"{sev_emoji.get(a['severity'], '')} {a['title']}",
+                            "at": a["event_at"].isoformat() if a["event_at"] else None,
+                        })
+            except Exception as _e:
+                # Table may not exist on first deploy — silent skip
+                pass
+        except Exception as e:
+            import logging as _log
+            _log.getLogger("dashboard").warning("overview handler error: %s", e)
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_maker_stats(self, request: web.Request) -> web.Response:
+        """Batch B #7 — Per-symbol + per-user maker fill-rate drill-down.
+        Query: /api/maker-stats?days=1 (default 1, max 30)
+        Returns: {by_symbol: [...], by_user: [...], totals: {...}}
+        """
+        try:
+            days = max(1, min(30, int(request.query.get("days", "1"))))
+        except Exception:
+            days = 1
+        out = {"days": days, "by_symbol": [], "by_user": [], "totals": {}}
+        if not self._db_pool:
+            out["error"] = "db_pool_not_ready"
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            async with self._db_pool.acquire() as con:
+                # Per-symbol breakdown (real trades only)
+                rows = await con.fetch(
+                    f"""SELECT symbol,
+                              COUNT(*) AS n,
+                              SUM(CASE WHEN COALESCE(metadata::jsonb->>'fee_type','') = 'maker' THEN 1 ELSE 0 END) AS makers,
+                              MAX(opened_at) AS last_at
+                       FROM user_trades
+                       WHERE trade_type = 'real'
+                         AND opened_at >= NOW() - INTERVAL '{days} days'
+                       GROUP BY symbol
+                       ORDER BY n DESC, symbol"""
+                )
+                for r in rows:
+                    n = int(r["n"]); makers = int(r["makers"] or 0)
+                    out["by_symbol"].append({
+                        "symbol": r["symbol"],
+                        "n": n, "makers": makers, "takers": n - makers,
+                        "maker_pct": (makers / n * 100.0) if n else None,
+                        "last_at": r["last_at"].isoformat() if r["last_at"] else None,
+                    })
+
+                # Per-user breakdown
+                rows = await con.fetch(
+                    f"""SELECT u.email, u.maker_patience_mode AS mode,
+                              COUNT(*) AS n,
+                              SUM(CASE WHEN COALESCE(ut.metadata::jsonb->>'fee_type','') = 'maker' THEN 1 ELSE 0 END) AS makers,
+                              MAX(ut.opened_at) AS last_at
+                       FROM user_trades ut JOIN users u ON ut.user_id = u.id
+                       WHERE ut.trade_type = 'real'
+                         AND ut.opened_at >= NOW() - INTERVAL '{days} days'
+                       GROUP BY u.email, u.maker_patience_mode
+                       ORDER BY n DESC, u.email"""
+                )
+                for r in rows:
+                    n = int(r["n"]); makers = int(r["makers"] or 0)
+                    out["by_user"].append({
+                        "email": r["email"], "mode": r["mode"] or "standard",
+                        "n": n, "makers": makers, "takers": n - makers,
+                        "maker_pct": (makers / n * 100.0) if n else None,
+                        "last_at": r["last_at"].isoformat() if r["last_at"] else None,
+                    })
+
+                # Totals
+                tot = await con.fetchrow(
+                    f"""SELECT COUNT(*) AS n,
+                              SUM(CASE WHEN COALESCE(metadata::jsonb->>'fee_type','') = 'maker' THEN 1 ELSE 0 END) AS makers
+                       FROM user_trades
+                       WHERE trade_type = 'real'
+                         AND opened_at >= NOW() - INTERVAL '{days} days'"""
+                )
+                if tot and tot["n"]:
+                    n = int(tot["n"]); makers = int(tot["makers"] or 0)
+                    out["totals"] = {"n": n, "makers": makers, "takers": n - makers,
+                                     "maker_pct": (makers / n * 100.0) if n else None}
+        except Exception as e:
+            import logging as _log
+            _log.getLogger("dashboard").warning("maker-stats error: %s", e)
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_copilot_queue(self, request: web.Request) -> web.Response:
+        """Co-pilot Sprint 1: returns unacked + un-snoozed events for the
+        Decisions Queued For You panel. Per docs/COPILOT_PIVOT_v1.md."""
+        out = {"items": [], "ts": datetime.utcnow().isoformat()}
+        if not self._db_pool:
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            async with self._db_pool.acquire() as con:
+                rows = await con.fetch(
+                    """SELECT id, event_type, severity, title, detail,
+                              cohort, metric_key, metric_before, metric_after,
+                              event_at
+                       FROM auto_revert_events
+                       WHERE acknowledged = FALSE
+                       ORDER BY
+                         CASE severity
+                           WHEN 'critical' THEN 1
+                           WHEN 'error'    THEN 2
+                           WHEN 'warn'     THEN 3
+                           ELSE 4 END,
+                         event_at DESC
+                       LIMIT 8"""
+                )
+                for r in rows:
+                    out["items"].append({
+                        "id": r["id"],
+                        "event_type": r["event_type"],
+                        "severity": r["severity"],
+                        "title": r["title"],
+                        "detail": r["detail"] or "",
+                        "cohort": r["cohort"] or "",
+                        "metric_key": r["metric_key"] or "",
+                        "metric_before": float(r["metric_before"]) if r["metric_before"] is not None else None,
+                        "metric_after": float(r["metric_after"]) if r["metric_after"] is not None else None,
+                        "event_at": r["event_at"].isoformat() if r["event_at"] else None,
+                    })
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_copilot_action(self, request: web.Request) -> web.Response:
+        """Co-pilot Sprint 1: handle architect actions on queue items."""
+        out = {"ok": False}
+        if not self._db_pool:
+            out["error"] = "db_pool_not_ready"
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            body = await request.json()
+            eid = int(body.get("event_id"))
+            action = str(body.get("action", "")).lower()
+            ALLOWED = {"acknowledge", "investigate", "override", "snooze"}
+            if action not in ALLOWED:
+                out["error"] = f"unknown_action:{action}"
+                return web.json_response(out, status=400, dumps=_safe_dumps)
+            ack_by = "architect_via_dashboard"
+            async with self._db_pool.acquire() as con:
+                if action in ("acknowledge", "investigate", "override"):
+                    await con.execute(
+                        """UPDATE auto_revert_events
+                              SET acknowledged = TRUE, ack_by = $1, ack_at = NOW()
+                            WHERE id = $2""",
+                        ack_by, eid
+                    )
+                elif action == "snooze":
+                    # MVP: snooze == hide for 24h via separate event re-emit
+                    await con.execute(
+                        "UPDATE auto_revert_events SET acknowledged = TRUE, ack_by = $1, ack_at = NOW() "
+                        "WHERE id = $2",
+                        ack_by + "_snoozed", eid,
+                    )
+            out["ok"] = True
+            out["event_id"] = eid
+            out["action"] = action
+        except Exception as e:
+            out["error"] = str(e)[:200]
+            return web.json_response(out, status=500, dumps=_safe_dumps)
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_quant_metrics(self, request: web.Request) -> web.Response:
+        """Phase 3: quant-grade hero metrics (Sharpe, Sortino, PF, MaxDD).
+        Computed server-side from user_trades. Single endpoint replaces
+        the fitness-app dollar cards.
+
+        Query: ?days=N (default 30) ?mode=paper|real|shadow|all (default all)
+               ?clean=true|false (default true) — when true, excludes the
+               legacy `auto_responder_stuck_60m` zero-PnL force-closes that
+               accumulated before the 2026-04-27 max_age fix (06:41 UTC).
+               These are administrative cleanup rows, not real exits, and
+               they massively distort WR/Sharpe/PF for shadow.
+               Also excludes phase2_virtual fan-out trades from the
+               aggregate (they're tracked separately via leaderboard).
+        """
+        import math
+        days = max(1, min(365, int(request.query.get("days", "30"))))
+        mode = request.query.get("mode", "all").lower()
+        clean = request.query.get("clean", "true").lower() == "true"
+        out = {
+            "days": days, "mode": mode, "clean": clean, "n": 0, "excluded_n": 0,
+            "sharpe": None, "sortino": None,
+            "pf": None, "win_rate": None,
+            "avg_win": None, "avg_loss": None, "expectancy": None,
+            "max_dd_usd": None, "max_dd_pct": None,
+            "total_pnl": None, "best_trade": None, "worst_trade": None,
+        }
+        if not self._db_pool:
+            out["error"] = "db_pool_not_ready"
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            mode_filter = ""
+            params = []
+            if mode != "all":
+                mode_filter = "AND trade_type = $1"
+                params.append(mode)
+            # 2026-04-27 — clean filter: drop legacy stuck-60m force-closes
+            # + any phase2_virtual fan-out rows. Both contaminate aggregate
+            # metrics for the operator-facing edge view.
+            clean_filter = ""
+            if clean:
+                clean_filter = (
+                    "AND COALESCE(metadata::jsonb->>'exit_reason', '') "
+                    "        NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close') "
+                    "AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') "
+                    "    != 'true' OR "
+                    "    COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary') "
+                )
+            sql = f"""SELECT pnl_usd::float AS pnl, opened_at, closed_at
+                       FROM user_trades
+                       WHERE closed_at >= NOW() - INTERVAL '{days} days'
+                         AND closed_at IS NOT NULL
+                         AND pnl_usd IS NOT NULL
+                         {mode_filter}
+                         {clean_filter}
+                       ORDER BY closed_at"""
+            async with self._db_pool.acquire() as con:
+                rows = await con.fetch(sql, *params)
+                # Count what we excluded so the UI can footnote it.
+                if clean:
+                    excl = await con.fetchval(
+                        f"""SELECT COUNT(*)::int FROM user_trades
+                             WHERE closed_at >= NOW() - INTERVAL '{days} days'
+                               AND closed_at IS NOT NULL
+                               AND pnl_usd IS NOT NULL
+                               {mode_filter}
+                               AND (COALESCE(metadata::jsonb->>'exit_reason', '')
+                                       IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close')
+                                    OR (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') = 'true'
+                                        AND COALESCE(metadata::jsonb->>'exit_config_id','') != 'primary'))""",
+                        *params,
+                    )
+                    out["excluded_n"] = int(excl or 0)
+            pnls = [float(r["pnl"]) for r in rows]
+            n = len(pnls)
+            out["n"] = n
+            if n == 0:
+                return web.json_response(out, dumps=_safe_dumps)
+
+            mean = sum(pnls) / n
+            variance = sum((p - mean) ** 2 for p in pnls) / n if n > 1 else 0.0
+            std = math.sqrt(variance) if variance > 0 else 0.0
+            downside_returns = [p for p in pnls if p < 0]
+            downside_var = sum(p ** 2 for p in downside_returns) / n if n > 0 else 0.0
+            downside_std = math.sqrt(downside_var) if downside_var > 0 else 0.0
+
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p < 0]
+            gross_w = sum(wins)
+            gross_l = abs(sum(losses))
+            win_rate = (len(wins) / n * 100.0) if n else None
+            pf = (gross_w / gross_l) if gross_l > 0 else (float("inf") if gross_w > 0 else None)
+            avg_win = (gross_w / len(wins)) if wins else None
+            avg_loss = (-gross_l / len(losses)) if losses else None  # negative number
+            expectancy = mean
+
+            # Sharpe (per-trade, no annualization — operator scale)
+            sharpe = (mean / std) if std > 0 else None
+            sortino = (mean / downside_std) if downside_std > 0 else None
+
+            # Max drawdown (peak-to-trough on cumulative PnL)
+            cum = 0.0
+            peak = 0.0
+            max_dd = 0.0
+            for p in pnls:
+                cum += p
+                if cum > peak:
+                    peak = cum
+                dd = peak - cum
+                if dd > max_dd:
+                    max_dd = dd
+            max_dd_pct = (max_dd / peak * 100.0) if peak > 0 else None
+
+            out.update({
+                "sharpe": sharpe,
+                "sortino": sortino,
+                "pf": (pf if pf != float("inf") else None),
+                "win_rate": win_rate,
+                "avg_win": avg_win,
+                "avg_loss": avg_loss,
+                "expectancy": expectancy,
+                "max_dd_usd": max_dd,
+                "max_dd_pct": max_dd_pct,
+                "total_pnl": sum(pnls),
+                "best_trade": max(pnls),
+                "worst_trade": min(pnls),
+            })
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_exchange_comparison(self, request: web.Request) -> web.Response:
+        """Exchange Compare tab — side-by-side metrics for paper / delta_india / bybit.
+        Query: ?days=N (default 7, max 90)
+        Returns per-exchange aggregates for the comparison panel.
+        """
+        import math
+        days = max(1, min(90, int(request.query.get("days", "7"))))
+        out = {"days": days, "by_exchange": {}, "overall_paper": {}, "ts": datetime.utcnow().isoformat()}
+        if not self._db_pool:
+            out["error"] = "db_pool_not_ready"
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            async with self._db_pool.acquire() as con:
+                # 2026-04-27 — clean filter: drop admin/orphan/reconcile
+                # closes (PnL=$0 force-cleanups by Agent 9-A or restart
+                # reconciler) + Phase 2 fan-out fan-out trades. Without
+                # this, Exchange Compare tab over-states paper baseline,
+                # under-states delta_india edge, and shows phantom bybit
+                # numbers from before the bybit dispatcher pause.
+                _CLEAN_NOT_IN = (
+                    "AND COALESCE(metadata::jsonb->>'exit_reason','') "
+                    "    NOT IN ('auto_responder_stuck_60m', "
+                    "            'restart_orphan_cleanup', "
+                    "            'reconcile_overaged_close') "
+                    "AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') "
+                    "    != 'true' OR "
+                    "    COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary') "
+                )
+
+                # Paper trades (no exchange concept — separate aggregate)
+                paper = await con.fetchrow(
+                    f"""SELECT COUNT(*) AS n,
+                              SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                              SUM(CASE WHEN pnl_usd > 0 THEN pnl_usd ELSE 0 END)::float AS gw,
+                              SUM(CASE WHEN pnl_usd < 0 THEN -pnl_usd ELSE 0 END)::float AS gl,
+                              SUM(pnl_usd)::float AS pnl_total,
+                              AVG(pnl_usd)::float AS avg
+                         FROM user_trades
+                        WHERE trade_type = 'paper'
+                          AND closed_at >= NOW() - INTERVAL '{days} days'
+                          AND closed_at IS NOT NULL
+                          {_CLEAN_NOT_IN}"""
+                )
+                if paper and paper["n"]:
+                    n = int(paper["n"]); wins = int(paper["wins"] or 0)
+                    gw = float(paper["gw"] or 0); gl = float(paper["gl"] or 0)
+                    out["overall_paper"] = {
+                        "n": n,
+                        "wr_pct": (wins / n * 100.0) if n else None,
+                        "pf": (gw / gl) if gl > 0 else None,
+                        "pnl_total": float(paper["pnl_total"] or 0),
+                        "avg": float(paper["avg"] or 0),
+                    }
+
+                # Per-exchange shadow + real (clean filter applied)
+                exch_rows = await con.fetch(
+                    f"""SELECT exchange,
+                              COUNT(*) AS n,
+                              SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                              SUM(CASE WHEN pnl_usd > 0 THEN pnl_usd ELSE 0 END)::float AS gw,
+                              SUM(CASE WHEN pnl_usd < 0 THEN -pnl_usd ELSE 0 END)::float AS gl,
+                              SUM(pnl_usd)::float AS pnl_total,
+                              AVG(pnl_usd)::float AS avg,
+                              SUM(CASE WHEN COALESCE(metadata::jsonb->>'fee_type','') = 'maker' THEN 1 ELSE 0 END) AS makers,
+                              SUM(fees_usd)::float AS total_fees,
+                              array_agg(pnl_usd ORDER BY closed_at) AS pnl_series
+                         FROM user_trades
+                        WHERE trade_type IN ('shadow', 'real')
+                          AND closed_at >= NOW() - INTERVAL '{days} days'
+                          AND closed_at IS NOT NULL
+                          AND pnl_usd IS NOT NULL
+                          {_CLEAN_NOT_IN}
+                        GROUP BY exchange
+                        ORDER BY exchange"""
+                )
+
+                for r in exch_rows:
+                    n = int(r["n"]); wins = int(r["wins"] or 0)
+                    gw = float(r["gw"] or 0); gl = float(r["gl"] or 0)
+                    series = [float(p) for p in (r["pnl_series"] or []) if p is not None]
+                    # Sharpe (per-trade, no annualization)
+                    if len(series) > 1:
+                        m = sum(series) / len(series)
+                        var = sum((p - m) ** 2 for p in series) / len(series)
+                        sd = math.sqrt(var) if var > 0 else 0
+                        sharpe = (m / sd) if sd > 0 else None
+                    else:
+                        sharpe = None
+                    # Max drawdown
+                    cum = 0.0; peak = 0.0; max_dd = 0.0
+                    for p in series:
+                        cum += p
+                        if cum > peak:
+                            peak = cum
+                        if peak - cum > max_dd:
+                            max_dd = peak - cum
+                    out["by_exchange"][r["exchange"]] = {
+                        "n": n,
+                        "wins": wins,
+                        "wr_pct": (wins / n * 100.0) if n else None,
+                        "pf": (gw / gl) if gl > 0 else None,
+                        "pnl_total": float(r["pnl_total"] or 0),
+                        "avg": float(r["avg"] or 0),
+                        "makers": int(r["makers"] or 0),
+                        "maker_pct": (int(r["makers"] or 0) / n * 100.0) if n else None,
+                        "total_fees": float(r["total_fees"] or 0),
+                        "sharpe": sharpe,
+                        "max_dd_usd": max_dd,
+                    }
+        except Exception as e:
+            import logging as _log
+            _log.getLogger("dashboard").warning("exchange-comparison error: %s", e)
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    # ══════════════════════════════════════════════════════════════
+    # PAPER + SHADOW API family (2026-04-26)
+    # Unified shape: every trade dict has the same keys regardless of source.
+    # Paper trades come from signals_history.json (in-memory tracker).
+    # Shadow trades come from user_trades (DB) with exchange filter.
+    # ══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _normalize_paper_trade(s: dict) -> dict:
+        """Convert a signals_history.json entry to the unified trade shape."""
+        meta = s.get("metadata") or {}
+        return {
+            "trade_id":   s.get("trade_id") or s.get("signal_id"),
+            "symbol":     s.get("symbol"),
+            "side":       s.get("side"),
+            "entry_price": s.get("entry_price"),
+            "exit_price":  s.get("exit_price"),
+            "stop_loss":   s.get("stop_loss"),
+            "take_profits": s.get("take_profits") or [],
+            "quantity":    s.get("position_size"),
+            "leverage":    s.get("leverage"),
+            "pnl_usd":     s.get("pnl_usd", s.get("pnl")),
+            "pnl_pct":     s.get("pnl_pct"),
+            "fees_usd":    s.get("fees_usd"),
+            "opened_at":   s.get("entry_time", s.get("timestamp")),
+            "closed_at":   s.get("exit_time"),
+            "exit_reason": s.get("exit_reason"),
+            "scanner":     meta.get("scanner") or s.get("reason", "").split(":")[0] if s.get("reason") else None,
+            "grade":       s.get("grade"),
+            "confidence":  s.get("confidence"),
+            "regime":      s.get("regime"),
+            "fee_type":    None,             # paper has no fees
+            "exchange":    None,
+            "trade_type":  "paper",
+            "user_email":  None,
+            "metadata":    {k: v for k, v in meta.items() if k not in ("confirmations",)},
+        }
+
+    @staticmethod
+    def _row_to_trade(row) -> dict:
+        """Convert a user_trades DB row to the unified trade shape."""
+        meta = row["metadata"] if isinstance(row["metadata"], dict) else {}
+        sd = row["signal_data"] if isinstance(row["signal_data"], dict) else {}
+        opened = row["opened_at"]
+        closed = row["closed_at"]
+        return {
+            "trade_id":    str(row["id"]),
+            "symbol":      row["symbol"],
+            "side":        row["side"],
+            "entry_price": float(row["entry_price"]) if row["entry_price"] is not None else None,
+            "exit_price":  float(row["exit_price"]) if row["exit_price"] is not None else None,
+            "stop_loss":   meta.get("stop_loss"),
+            "take_profits": meta.get("take_profits") or [],
+            "quantity":    float(row["quantity"]) if row["quantity"] is not None else None,
+            "leverage":    meta.get("leverage"),
+            "pnl_usd":     float(row["pnl_usd"]) if row["pnl_usd"] is not None else None,
+            "pnl_pct":     None,
+            "fees_usd":    float(row["fees_usd"]) if row["fees_usd"] is not None else None,
+            "opened_at":   opened.isoformat() if opened else None,
+            "closed_at":   closed.isoformat() if closed else None,
+            "duration_sec": int((closed - opened).total_seconds()) if (opened and closed) else None,
+            "exit_reason": meta.get("exit_reason"),
+            "scanner":     meta.get("scanner") or sd.get("scanner"),
+            "grade":       meta.get("grade"),
+            "confidence":  None,
+            "regime":      meta.get("regime"),
+            "fee_type":    meta.get("fee_type"),
+            "exchange":    row["exchange"],
+            "trade_type":  row["trade_type"],
+            "user_email":  None,            # joined separately if requested
+        }
+
+    @staticmethod
+    def _aggregate_stats(trades: list) -> dict:
+        """Compute WR/PF/Sharpe/MaxDD/avg/total from a list of trade dicts (closed only)."""
+        import math
+        pnls = [float(t["pnl_usd"]) for t in trades if t.get("pnl_usd") is not None]
+        n = len(pnls)
+        if n == 0:
+            return {"n": 0}
+        wins = sum(1 for p in pnls if p > 0)
+        gw = sum(p for p in pnls if p > 0)
+        gl = sum(-p for p in pnls if p < 0)
+        m = sum(pnls) / n
+        var = sum((p - m) ** 2 for p in pnls) / n if n > 1 else 0.0
+        sd = math.sqrt(var) if var > 0 else 0.0
+        # Max drawdown on cumulative PnL
+        cum = 0.0; peak = 0.0; max_dd = 0.0
+        for p in pnls:
+            cum += p
+            if cum > peak: peak = cum
+            if peak - cum > max_dd: max_dd = peak - cum
+        # Maker fills (only meaningful for shadow/real)
+        maker_fills = sum(1 for t in trades if t.get("fee_type") == "maker")
+        return {
+            "n": n,
+            "wins": wins,
+            "wr_pct": (wins / n * 100.0) if n else None,
+            "pf": (gw / gl) if gl > 0 else None,
+            "sharpe": (m / sd) if sd > 0 else None,
+            "avg_pnl": m,
+            "total_pnl": sum(pnls),
+            "best_trade": max(pnls),
+            "worst_trade": min(pnls),
+            "max_dd_usd": max_dd,
+            "maker_fills": maker_fills,
+            "maker_pct": (maker_fills / n * 100.0) if n else None,
+            "total_fees": sum(float(t["fees_usd"]) for t in trades if t.get("fees_usd") is not None),
+        }
+
+    def _load_paper_signals(self, source: str) -> list:
+        """Load + parse paper signals storage. source: 'active' | 'closed'."""
+        import json as _json
+        path = "/home/opc/crypto-trading-bot/storage/" + (
+            "signals_history.json" if source == "active" else "closed_signals.json"
+        )
+        try:
+            with open(path) as f:
+                d = _json.load(f)
+            arr = d if isinstance(d, list) else d.get("signals", []) if isinstance(d, dict) else []
+            return arr
+        except Exception:
+            return []
+
+    # ── Paper endpoints ────────────────────────────────────────────
+
+    async def _handle_paper_active(self, request: web.Request) -> web.Response:
+        """GET /api/paper/active → currently-tracked open paper signals."""
+        try:
+            limit = max(1, min(500, int(request.query.get("limit", "100"))))
+        except Exception:
+            limit = 100
+        signals = self._load_paper_signals("active")
+        # Active signals = no exit_price set
+        active = [s for s in signals if not s.get("exit_price")]
+        trades = [self._normalize_paper_trade(s) for s in active[-limit:]]
+        return web.json_response({
+            "trades": trades, "n": len(trades),
+            "filters": {"limit": limit}, "source": "signals_history.json",
+            "ts": datetime.utcnow().isoformat() + "Z",
+        }, dumps=_safe_dumps)
+
+    async def _handle_paper_closed(self, request: web.Request) -> web.Response:
+        """GET /api/paper/closed?limit=N&symbol=BTC/USDT&days=N"""
+        try:
+            limit = max(1, min(2000, int(request.query.get("limit", "100"))))
+            days = int(request.query.get("days", "0"))
+        except Exception:
+            limit, days = 100, 0
+        symbol = request.query.get("symbol", "")
+        signals = self._load_paper_signals("closed")
+        # Filter by symbol + days
+        if symbol:
+            signals = [s for s in signals if s.get("symbol") == symbol]
+        if days > 0:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            signals = [s for s in signals
+                       if s.get("exit_time") and self._parse_iso_safe(s["exit_time"]) >= cutoff]
+        signals = signals[-limit:]
+        trades = [self._normalize_paper_trade(s) for s in signals]
+        return web.json_response({
+            "trades": trades, "n": len(trades),
+            "filters": {"limit": limit, "days": days, "symbol": symbol or None},
+            "source": "closed_signals.json",
+            "ts": datetime.utcnow().isoformat() + "Z",
+        }, dumps=_safe_dumps)
+
+    async def _handle_paper_stats(self, request: web.Request) -> web.Response:
+        """GET /api/paper/stats?days=N → aggregate metrics from paper trades."""
+        try:
+            days = max(1, min(365, int(request.query.get("days", "7"))))
+        except Exception:
+            days = 7
+        signals = self._load_paper_signals("closed")
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        in_window = [s for s in signals
+                     if s.get("exit_time") and self._parse_iso_safe(s["exit_time"]) >= cutoff]
+        trades = [self._normalize_paper_trade(s) for s in in_window]
+        stats = self._aggregate_stats(trades)
+        return web.json_response({
+            "trade_type": "paper", "days": days, **stats,
+            "ts": datetime.utcnow().isoformat() + "Z",
+        }, dumps=_safe_dumps)
+
+    @staticmethod
+    def _parse_iso_safe(s):
+        try:
+            return datetime.fromisoformat(str(s).replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return datetime.min
+
+    # ── Shadow endpoints ───────────────────────────────────────────
+
+    async def _handle_shadow_exchanges(self, request: web.Request) -> web.Response:
+        """GET /api/shadow/exchanges → list of exchanges with shadow data + counts."""
+        out = {"exchanges": [], "ts": datetime.utcnow().isoformat() + "Z"}
+        if not self._db_pool:
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            async with self._db_pool.acquire() as con:
+                rows = await con.fetch(
+                    """SELECT exchange,
+                              COUNT(*) AS n,
+                              SUM(CASE WHEN closed_at IS NOT NULL THEN 1 ELSE 0 END) AS closed,
+                              MAX(opened_at) AS last_open
+                         FROM user_trades
+                        WHERE trade_type IN ('shadow', 'real')
+                        GROUP BY exchange ORDER BY exchange"""
+                )
+                out["exchanges"] = [
+                    {"exchange": r["exchange"], "n": int(r["n"]), "closed": int(r["closed"] or 0),
+                     "last_open": r["last_open"].isoformat() if r["last_open"] else None}
+                    for r in rows
+                ]
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_shadow_active(self, request: web.Request) -> web.Response:
+        """GET /api/shadow/active?exchange=delta_india|bybit&clean=true|false
+
+        clean=true (default) hides Phase 2 fan-out virtual trades from the
+        active list — they have their own dedicated leaderboard widget
+        (/api/phase2/leaderboard). 41 phase2_virtual trades open at any
+        given moment otherwise drown the operator's "current real positions"
+        view.
+        """
+        exchange = request.query.get("exchange", "delta_india")
+        clean = request.query.get("clean", "true").lower() == "true"
+        out = {"trades": [], "n": 0, "excluded_n": 0, "clean": clean,
+               "filters": {"exchange": exchange, "clean": clean},
+               "ts": datetime.utcnow().isoformat() + "Z"}
+        if not self._db_pool:
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            async with self._db_pool.acquire() as con:
+                clean_clause = ""
+                if clean:
+                    clean_clause = (
+                        "AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') "
+                    "    != 'true' OR "
+                    "    COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary') "
+                    )
+                rows = await con.fetch(
+                    f"""SELECT * FROM user_trades
+                        WHERE trade_type = 'shadow'
+                          AND exchange = $1
+                          AND closed_at IS NULL
+                          {clean_clause}
+                        ORDER BY opened_at DESC LIMIT 200""", exchange
+                )
+                out["trades"] = [self._row_to_trade(r) for r in rows]
+                out["n"] = len(out["trades"])
+                if clean:
+                    excl = await con.fetchval(
+                        """SELECT COUNT(*)::int FROM user_trades
+                            WHERE trade_type='shadow' AND exchange=$1
+                              AND closed_at IS NULL
+                              AND COALESCE(metadata::jsonb->>'is_phase2_virtual','false')
+                                  = 'true'""",
+                        exchange,
+                    )
+                    out["excluded_n"] = int(excl or 0)
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_shadow_closed(self, request: web.Request) -> web.Response:
+        """GET /api/shadow/closed?exchange=delta_india&limit=N&days=N&symbol=BTC/USDT
+                              &clean=true|false (default true)
+
+        clean=true (default) excludes:
+          - `auto_responder_stuck_60m` legacy force-closes (zero-PnL admin
+            cleanup before 2026-04-27 06:41 UTC max_age fix)
+          - `is_phase2_virtual` fan-out rows (tracked via leaderboard)
+        Pass clean=false to inspect raw audit trail.
+        """
+        exchange = request.query.get("exchange", "delta_india")
+        try:
+            limit = max(1, min(2000, int(request.query.get("limit", "100"))))
+            days = int(request.query.get("days", "7"))
+        except Exception:
+            limit, days = 100, 7
+        symbol = request.query.get("symbol", "")
+        clean = request.query.get("clean", "true").lower() == "true"
+        out = {"trades": [], "n": 0, "excluded_n": 0, "clean": clean,
+               "filters": {"exchange": exchange, "limit": limit, "days": days,
+                           "symbol": symbol or None, "clean": clean},
+               "ts": datetime.utcnow().isoformat() + "Z"}
+        if not self._db_pool:
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            async with self._db_pool.acquire() as con:
+                params = [exchange]
+                sym_clause = ""
+                if symbol:
+                    params.append(symbol)
+                    sym_clause = "AND symbol = $2 "
+                clean_clause = ""
+                if clean:
+                    clean_clause = (
+                        "AND COALESCE(metadata::jsonb->>'exit_reason','') "
+                        "    NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close') "
+                        "AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') "
+                    "    != 'true' OR "
+                    "    COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary') "
+                    )
+                rows = await con.fetch(
+                    f"""SELECT * FROM user_trades
+                         WHERE trade_type = 'shadow'
+                           AND exchange = $1
+                           AND closed_at IS NOT NULL
+                           AND closed_at >= NOW() - INTERVAL '{days} days'
+                           {sym_clause}
+                           {clean_clause}
+                         ORDER BY closed_at DESC LIMIT {limit}""",
+                    *params
+                )
+                out["trades"] = [self._row_to_trade(r) for r in rows]
+                out["n"] = len(out["trades"])
+                if clean:
+                    excl = await con.fetchval(
+                        f"""SELECT COUNT(*)::int FROM user_trades
+                             WHERE trade_type='shadow' AND exchange=$1
+                               AND closed_at IS NOT NULL
+                               AND closed_at >= NOW() - INTERVAL '{days} days'
+                               {sym_clause}
+                               AND (COALESCE(metadata::jsonb->>'exit_reason','')
+                                       IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close')
+                                    OR (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') = 'true'
+                                        AND COALESCE(metadata::jsonb->>'exit_config_id','') != 'primary'))""",
+                        *params,
+                    )
+                    out["excluded_n"] = int(excl or 0)
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_shadow_stats(self, request: web.Request) -> web.Response:
+        """GET /api/shadow/stats?exchange=delta_india&days=N&clean=true → aggregate metrics.
+
+        clean=true (default) excludes auto_responder_stuck_60m + phase2_virtual rows.
+        See _handle_shadow_closed for rationale.
+        """
+        exchange = request.query.get("exchange", "delta_india")
+        try:
+            days = max(1, min(365, int(request.query.get("days", "7"))))
+        except Exception:
+            days = 7
+        clean = request.query.get("clean", "true").lower() == "true"
+        out = {"trade_type": "shadow", "exchange": exchange, "days": days, "clean": clean,
+               "ts": datetime.utcnow().isoformat() + "Z"}
+        if not self._db_pool:
+            out["error"] = "db_pool_not_ready"
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            async with self._db_pool.acquire() as con:
+                clean_clause = ""
+                if clean:
+                    clean_clause = (
+                        "AND COALESCE(metadata::jsonb->>'exit_reason','') "
+                        "    NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close') "
+                        "AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') "
+                    "    != 'true' OR "
+                    "    COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary') "
+                    )
+                rows = await con.fetch(
+                    f"""SELECT * FROM user_trades
+                         WHERE trade_type = 'shadow'
+                           AND exchange = $1
+                           AND closed_at IS NOT NULL
+                           AND closed_at >= NOW() - INTERVAL '{days} days'
+                           {clean_clause}""",
+                    exchange
+                )
+                trades = [self._row_to_trade(r) for r in rows]
+            out.update(self._aggregate_stats(trades))
+            # Also include per-symbol breakdown
+            from collections import defaultdict
+            per_sym = defaultdict(list)
+            for t in trades:
+                per_sym[t["symbol"]].append(t)
+            out["by_symbol"] = {sym: self._aggregate_stats(ts) for sym, ts in per_sym.items()}
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_phase2_leaderboard(self, request: web.Request) -> web.Response:
+        """Phase 2 Shadow-of-Shadow leaderboard endpoint.
+
+        Aggregates per exit_config_id over the requested window. Returns
+        rows sorted by net PnL desc, plus the winner. Frontend widget
+        polls this every 60s for the live A/B/C/D/E verdict.
+
+        Query: ?hours=N (default 24, min 1, max 168)
+
+        Note: only CLOSED phase2_virtual trades are aggregated. Open
+        trades are returned in `n_open` so the operator can see how
+        much sample is still pending.
+        """
+        try:
+            hours = max(1, min(168, int(request.query.get("hours", "24"))))
+        except Exception:
+            hours = 24
+        out = {
+            "hours": hours, "configs": [], "winner": None,
+            "n_total_open": 0, "n_total_closed": 0,
+            "ts": datetime.utcnow().isoformat() + "Z",
+        }
+        if not self._db_pool:
+            out["error"] = "db_pool_not_ready"
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            # 2026-04-27 — exclude admin force-closes from per-config
+            # aggregates so the leaderboard reflects ACTUAL strategy
+            # performance under each config, not Agent 9-A's restart
+            # cleanup. auto_responder_stuck_60m + restart_orphan_cleanup
+            # are both PnL=$0 admin events, not exits the config triggered.
+            # Counts of these admin closes are surfaced separately so the
+            # operator sees attribution loss.
+            sql = f"""
+                SELECT
+                    metadata::jsonb->>'exit_config_id' AS cfg,
+                    COUNT(*) AS n_total,
+                    COUNT(*) FILTER (WHERE closed_at IS NOT NULL
+                        AND COALESCE(metadata::jsonb->>'exit_reason','')
+                            NOT IN ('auto_responder_stuck_60m',
+                                    'restart_orphan_cleanup')) AS n_closed,
+                    COUNT(*) FILTER (WHERE closed_at IS NULL) AS n_open,
+                    COUNT(*) FILTER (WHERE COALESCE(metadata::jsonb->>'exit_reason','')
+                            IN ('auto_responder_stuck_60m',
+                                'restart_orphan_cleanup')) AS n_admin_closed,
+                    SUM(CASE WHEN closed_at IS NOT NULL
+                              AND COALESCE(metadata::jsonb->>'exit_reason','')
+                                  NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close')
+                             THEN pnl_usd END)::float AS net,
+                    SUM(CASE WHEN pnl_usd > 0
+                              AND COALESCE(metadata::jsonb->>'exit_reason','')
+                                  NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close')
+                             THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN pnl_usd > 0
+                              AND COALESCE(metadata::jsonb->>'exit_reason','')
+                                  NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close')
+                             THEN pnl_usd ELSE 0 END)::float AS gross_w,
+                    SUM(CASE WHEN pnl_usd < 0
+                              AND COALESCE(metadata::jsonb->>'exit_reason','')
+                                  NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close')
+                             THEN -pnl_usd ELSE 0 END)::float AS gross_l,
+                    AVG(CASE WHEN closed_at IS NOT NULL
+                              AND COALESCE(metadata::jsonb->>'exit_reason','')
+                                  NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close')
+                             THEN pnl_usd END)::float AS avg_pnl,
+                    MAX(metadata::jsonb->>'exit_config_summary') AS summary
+                FROM user_trades
+                WHERE COALESCE(metadata::jsonb->>'is_phase2_virtual','false') = 'true'
+                  AND opened_at >= NOW() - INTERVAL '{hours} hours'
+                  AND metadata::jsonb->>'exit_config_id' IS NOT NULL
+                GROUP BY metadata::jsonb->>'exit_config_id'
+            """
+            async with self._db_pool.acquire() as con:
+                rows = await con.fetch(sql)
+            configs = []
+            for r in rows:
+                n_closed = int(r["n_closed"] or 0)
+                wins = int(r["wins"] or 0)
+                gross_w = float(r["gross_w"] or 0)
+                gross_l = float(r["gross_l"] or 0)
+                wr = (wins / n_closed * 100.0) if n_closed > 0 else None
+                pf = (gross_w / gross_l) if gross_l > 0 else (None if gross_w == 0 else float("inf"))
+                configs.append({
+                    "id": r["cfg"],
+                    "n_total": int(r["n_total"] or 0),
+                    "n_closed": n_closed,
+                    "n_open": int(r["n_open"] or 0),
+                    "n_admin_closed": int(r["n_admin_closed"] or 0),
+                    "wins": wins,
+                    "wr_pct": wr,
+                    "net": float(r["net"] or 0),
+                    "avg_pnl": float(r["avg_pnl"] or 0) if r["avg_pnl"] is not None else None,
+                    "pf": pf if pf != float("inf") else None,
+                    "pf_inf": pf == float("inf"),
+                    "summary": r["summary"] or "",
+                })
+                out["n_total_open"] += int(r["n_open"] or 0)
+                out["n_total_closed"] += n_closed
+            # Sort by net desc; winner = first non-empty row by net
+            configs.sort(key=lambda c: -(c["net"] or 0))
+            out["configs"] = configs
+            # Winner only if at least 5 closed trades AND positive net
+            for c in configs:
+                if c["n_closed"] >= 5 and (c["net"] or 0) > 0:
+                    out["winner"] = c["id"]
+                    break
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_agents_team(self, request: web.Request) -> web.Response:
+        """Agents TEAM status — live fire times for the 14-agent team +
+        Tier A/B + specialty crons. Reads file mtimes from storage/ subdirs
+        (cheap, no DB hit, no journalctl perms required). Each agent is
+        mapped to a primary output file or directory; mtime → last_fire_at.
+        Status derived from cadence_min and time-since-last-fire:
+            green:  age <= 1.5 × cadence
+            yellow: age <= 3.0 × cadence
+            red:    age >  3.0 × cadence (or file missing)
+        Cadence_min = 0 means event-driven (no expected schedule); status
+        is always neutral.
+
+        Renamed from /api/agents/status to /api/agents/team because
+        /api/agents/status is taken by the ML-models legacy endpoint
+        (returns ml_models[], qa_results[], etc.).
+        """
+        import os, glob
+        from pathlib import Path
+
+        STORAGE = Path("/home/opc/crypto-trading-bot/storage")
+        AGENTS = [
+            # Tier 3 specialist agents
+            {"id": "edge_validator",     "name": "Edge Validator (auto-revert)",     "tier": "T3 Research", "cadence_min": 30,    "globs": ["auto_responder/actions.log"], "log_tag": "auto_revert"},
+            {"id": "deploy_gatekeeper",  "name": "Deploy Gatekeeper",                "tier": "T3 Engrg",    "cadence_min": 0,     "globs": ["../scripts/deploy_gatekeeper.sh"]},
+            {"id": "code_review",        "name": "Code Review (rollback diff)",      "tier": "T3 Engrg",    "cadence_min": 1440,  "globs": ["code_review/*.md"]},
+            {"id": "silent_failure",     "name": "Silent Failure Hunter",            "tier": "T3 Ops",      "cadence_min": 60,    "globs": ["incidents/*.md"]},
+            {"id": "sync_reconciler",    "name": "Sync Reconciler (in-process)",     "tier": "T3 Ops",      "cadence_min": 0,     "globs": ["../execution/user_real_manager.py"]},
+            {"id": "risk_monitor",       "name": "Risk Monitor (Tier A)",            "tier": "T3 Ops",      "cadence_min": 5,     "globs": ["heartbeat/alerts.log"]},
+            {"id": "compliance",         "name": "Compliance Auditor",               "tier": "T3 Ops",      "cadence_min": 43200, "globs": ["compliance/*.md"]},
+            {"id": "incident_responder", "name": "Incident Responder",               "tier": "T3 Ops",      "cadence_min": 5,     "globs": ["incidents/*.md", "auto_responder/actions.log"]},
+            {"id": "data_integrity",     "name": "Data Integrity Engineer",          "tier": "T3 Engrg",    "cadence_min": 1440,  "globs": ["qa_reports/*"]},
+            {"id": "ux_audit",           "name": "UI/UX Designer (audit)",           "tier": "T3 Cross",    "cadence_min": 10080, "globs": ["ux_audit/*"]},
+            {"id": "daily_briefing",     "name": "Architect Briefing",               "tier": "T3 Cross",    "cadence_min": 1440,  "globs": ["daily_briefing/*"]},
+            {"id": "backtest_engineer",  "name": "Backtest Engineer",                "tier": "T3 Research", "cadence_min": 43200, "globs": ["backtest_engineer/*.md"]},
+            {"id": "ml_pipeline",        "name": "ML Pipeline Operator",             "tier": "T3 Cross",    "cadence_min": 15,    "globs": ["ml_models/*"]},
+            # Phase 2 add-ons
+            {"id": "venue_perf",         "name": "Venue Performance Watcher",        "tier": "Phase 2",     "cadence_min": 360,   "globs": ["venue_perf/*.md"]},
+            {"id": "process_heartbeat",  "name": "Process Heartbeat Watcher",        "tier": "Phase 2",     "cadence_min": 10,    "globs": ["heartbeat/alerts.log"]},
+            {"id": "cohort_pause",       "name": "Cohort Pause Surfacer",            "tier": "Phase 2",     "cadence_min": 1440,  "globs": ["cohort_pause/*.md"]},
+            # Tier A — deterministic auto-fix
+            {"id": "incident_auto_a",    "name": "Incident Auto-Responder (Tier A)", "tier": "Tier A",      "cadence_min": 5,     "globs": ["auto_responder/actions.log"]},
+            {"id": "ux_patcher_a",       "name": "UX Auto-Patcher (Tier A)",         "tier": "Tier A",      "cadence_min": 10080, "globs": ["ux_audit/*"]},
+            # Specialty crons
+            {"id": "chief_quant",        "name": "🧠 Chief Quant Continuous Briefing","tier": "Meta-Agent",  "cadence_min": 30,    "globs": ["chief_quant/briefing_*.md"]},
+            {"id": "paper_shadow_gap",   "name": "Paper-vs-Shadow Gap Monitor",      "tier": "Phase 2",     "cadence_min": 30,    "globs": ["paper_shadow_gap/gap_*.md"]},
+            {"id": "lever_verdict",      "name": "Lever Verdict Author",             "tier": "Specialty",   "cadence_min": 1440,  "globs": ["verdicts/lever_verdict_*"]},
+            {"id": "maker_verdict",      "name": "Maker Mode Verdict",               "tier": "Specialty",   "cadence_min": 360,   "globs": ["verdicts/maker_verdict_*.md"]},
+            {"id": "strategy_decay",     "name": "Strategy Decay Monitor",           "tier": "Specialty",   "cadence_min": 60,    "globs": ["decay/latest.txt"]},
+            {"id": "eod_reconcile",      "name": "EOD Reconcile",                    "tier": "Specialty",   "cadence_min": 1440,  "globs": ["recon/eod_*.txt"]},
+            {"id": "phase2_leaderboard", "name": "Phase 2 Leaderboard (manual)",     "tier": "Specialty",   "cadence_min": 0,     "globs": ["phase2/leaderboard_*.md"]},
+            {"id": "phase3_sweep",       "name": "Phase 3 Historical Sweep (manual)","tier": "Specialty",   "cadence_min": 0,     "globs": ["phase3/historical_sweep_*.md"]},
+        ]
+
+        import time as _time
+        now = _time.time()
+        out = {"agents": [], "ts": datetime.utcnow().isoformat() + "Z",
+               "summary": {"green": 0, "yellow": 0, "red": 0, "neutral": 0}}
+        for a in AGENTS:
+            latest_mtime = 0.0
+            latest_file = ""
+            for g in a["globs"]:
+                p = STORAGE / g
+                # Glob expansion: STORAGE / "verdicts/maker_verdict_*.md"
+                matches = list(STORAGE.parent.glob(str(p.relative_to(STORAGE.parent)))) if "*" in g else ([p] if p.exists() else [])
+                for m in matches:
+                    try:
+                        mt = m.stat().st_mtime
+                        if mt > latest_mtime:
+                            latest_mtime = mt
+                            latest_file = m.name
+                    except Exception:
+                        pass
+            age_min = (now - latest_mtime) / 60.0 if latest_mtime > 0 else None
+            cad = a["cadence_min"]
+            if cad <= 0:
+                # event-driven: neutral status, just show last fire if any
+                status = "neutral"
+            elif latest_mtime == 0:
+                status = "red"
+            elif age_min <= cad * 1.5:
+                status = "green"
+            elif age_min <= cad * 3.0:
+                status = "yellow"
+            else:
+                status = "red"
+            out["summary"][status] = out["summary"].get(status, 0) + 1
+            out["agents"].append({
+                "id":            a["id"],
+                "name":          a["name"],
+                "tier":          a["tier"],
+                "cadence_min":   cad,
+                "last_file":     latest_file,
+                "last_mtime_s":  int(latest_mtime) if latest_mtime > 0 else None,
+                "age_min":       round(age_min, 1) if age_min is not None else None,
+                "status":        status,
+            })
+        # Sort: red → yellow → neutral → green; then by tier
+        STATUS_ORDER = {"red": 0, "yellow": 1, "neutral": 2, "green": 3}
+        out["agents"].sort(key=lambda x: (STATUS_ORDER.get(x["status"], 9), x["tier"], x["name"]))
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_chief_quant_latest(self, request: web.Request) -> web.Response:
+        """Serve the latest Chief Quant briefing markdown as plain text.
+        Dashboard widget renders this directly. Cron writes
+        storage/chief_quant/latest.md every 30 min.
+        """
+        from pathlib import Path
+        path = Path("/home/opc/crypto-trading-bot/storage/chief_quant/latest.md")
+        if not path.exists():
+            return web.Response(text="# Chief Quant briefing not yet generated\n\nFirst cron fires within 30 min.", content_type="text/markdown")
+        try:
+            return web.Response(text=path.read_text(), content_type="text/markdown")
+        except Exception as e:
+            return web.Response(text=f"# Error reading briefing\n\n{e}", content_type="text/markdown")
+
+    async def _handle_maker_counterfactual(self, request: web.Request) -> web.Response:
+        """Path A — maker counterfactual for shadow trades.
+
+        Reads cf_maker_savings_* fields stamped into close_meta by
+        _close_shadow on every shadow trade. Aggregates per window:
+            - Actual shadow PnL (100% taker)
+            - Counterfactual @ 50% maker fill (patient mode estimate)
+            - Counterfactual @ 100% maker fill (theoretical max)
+
+        Lets the operator see "if patient maker were working at X%, the
+        edge would be Y" without requiring the actual maker code to fire.
+        Calibrates against Path B real pilot when that lands.
+
+        Query: ?days=N (default 1, max 30) ?clean=true (default)
+        """
+        try:
+            days = max(1, min(30, int(request.query.get("days", "1"))))
+        except Exception:
+            days = 1
+        clean = request.query.get("clean", "true").lower() == "true"
+        out = {
+            "days": days, "clean": clean,
+            "n": 0,
+            "actual_net": 0.0,
+            "cf_50pct_savings": 0.0, "cf_50pct_net": 0.0,
+            "cf_100pct_savings": 0.0, "cf_100pct_net": 0.0,
+            "uplift_50pct_pct": None,
+            "uplift_100pct_pct": None,
+            "ts": datetime.utcnow().isoformat() + "Z",
+        }
+        if not self._db_pool:
+            out["error"] = "db_pool_not_ready"
+            return web.json_response(out, dumps=_safe_dumps)
+        try:
+            clean_clause = ""
+            if clean:
+                clean_clause = (
+                    "AND COALESCE(metadata::jsonb->>'exit_reason','') "
+                    "    NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close') "
+                    "AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') != 'true' "
+                    "     OR COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary') "
+                )
+            sql = f"""
+                SELECT
+                    COUNT(*) AS n,
+                    SUM(pnl_usd)::float AS actual_net,
+                    SUM(NULLIF(metadata::jsonb->>'cf_maker_savings_50pct','')::float)::float
+                        AS cf_50_savings,
+                    SUM(NULLIF(metadata::jsonb->>'cf_maker_savings_100pct','')::float)::float
+                        AS cf_100_savings
+                FROM user_trades
+                WHERE trade_type='shadow'
+                  AND closed_at >= NOW() - INTERVAL '{days} days'
+                  AND closed_at IS NOT NULL
+                  {clean_clause}
+            """
+            async with self._db_pool.acquire() as con:
+                row = await con.fetchrow(sql)
+            n = int(row["n"] or 0)
+            actual = float(row["actual_net"] or 0)
+            cf50_save = float(row["cf_50_savings"] or 0)
+            cf100_save = float(row["cf_100_savings"] or 0)
+            cf50_net = actual + cf50_save
+            cf100_net = actual + cf100_save
+            out.update({
+                "n": n,
+                "actual_net": round(actual, 2),
+                "cf_50pct_savings": round(cf50_save, 2),
+                "cf_50pct_net": round(cf50_net, 2),
+                "cf_100pct_savings": round(cf100_save, 2),
+                "cf_100pct_net": round(cf100_net, 2),
+                "uplift_50pct_pct":  round((cf50_save / abs(actual)) * 100, 1) if actual != 0 else None,
+                "uplift_100pct_pct": round((cf100_save / abs(actual)) * 100, 1) if actual != 0 else None,
+            })
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    # ══════════════════════════════════════════════════════════════
+
+    async def _handle_multi_exchange_overview(self, request: web.Request) -> web.Response:
+        """Per-exchange × trade_type breakdown for the multi-exchange UI overlay.
+        Returns: active (currently open), last (most recent close), today (24h aggregates).
+        Buckets: paper, delta_shadow, delta_real, bybit_shadow, bybit_demo, bybit_real.
+        """
+        out = {
+            "active": {},
+            "last": {},
+            "today": {},
+            "ts": datetime.utcnow().isoformat() + "Z",
+        }
+        if not self._db_pool:
+            out["error"] = "db_pool_not_ready"
+            return web.json_response(out, dumps=_safe_dumps)
+
+        BUCKETS = ["paper", "delta_shadow", "delta_real",
+                   "bybit_shadow", "bybit_demo", "bybit_real"]
+        for b in BUCKETS:
+            out["active"][b] = []
+            out["last"][b] = None
+            out["today"][b] = {"n": 0, "wr_pct": None, "pnl_total": 0.0, "fees": 0.0}
+
+        def bucket_for(exchange: str, trade_type: str) -> str:
+            tt = (trade_type or "").lower()
+            ex = (exchange or "").lower()
+            if tt == "paper":
+                return "paper"
+            if ex == "delta_india" and tt == "shadow":  return "delta_shadow"
+            if ex == "delta_india" and tt == "real":    return "delta_real"
+            if ex == "bybit"       and tt == "shadow":  return "bybit_shadow"
+            if ex == "bybit"       and tt == "demo":    return "bybit_demo"
+            if ex == "bybit"       and tt == "real":    return "bybit_real"
+            return "paper"  # fallback
+
+        try:
+            async with self._db_pool.acquire() as con:
+                # 1. ACTIVE — currently open, all exchanges.
+                # 2026-04-27 — clean filter excludes is_phase2_virtual
+                # so ~30 fan-out trades don't drown the active list.
+                rows = await con.fetch("""
+                    SELECT id::text, exchange, trade_type, symbol, side,
+                           entry_price, quantity, opened_at,
+                           COALESCE(metadata::jsonb->>'scanner','') AS scanner,
+                           COALESCE(metadata::jsonb->>'fee_type','') AS fee_type,
+                           NULLIF(metadata::jsonb->>'stop_loss','')::float   AS stop_loss,
+                           NULLIF(metadata::jsonb->>'take_profit','')::float AS take_profit,
+                           NULLIF(metadata::jsonb->>'leverage','')::float    AS leverage,
+                           NULLIF(metadata::jsonb->>'last_price','')::float  AS last_price
+                      FROM user_trades
+                     WHERE closed_at IS NULL
+                       AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') != 'true' OR COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary')
+                     ORDER BY opened_at DESC LIMIT 200
+                """)
+                for r in rows:
+                    b = bucket_for(r["exchange"], r["trade_type"])
+                    entry = float(r["entry_price"]) if r["entry_price"] is not None else None
+                    last  = float(r["last_price"])  if r["last_price"]  is not None else None
+                    qty   = float(r["quantity"])    if r["quantity"]    is not None else None
+                    upnl  = None
+                    if entry is not None and last is not None and qty is not None:
+                        sgn = 1.0 if (r["side"] or "").lower() == "long" else -1.0
+                        upnl = (last - entry) * qty * sgn
+                    out["active"][b].append({
+                        "id": r["id"], "symbol": r["symbol"], "side": r["side"],
+                        "entry_price": entry,
+                        "quantity":    qty,
+                        "opened_at":   r["opened_at"].isoformat() if r["opened_at"] else None,
+                        "scanner":     r["scanner"],
+                        "fee_type":    r["fee_type"],
+                        "stop_loss":   float(r["stop_loss"])   if r["stop_loss"]   is not None else None,
+                        "take_profit": float(r["take_profit"]) if r["take_profit"] is not None else None,
+                        "leverage":    float(r["leverage"])    if r["leverage"]    is not None else None,
+                        "last_price":  last,
+                        "unrealized_pnl": upnl,
+                    })
+
+                # 2. LAST closed per bucket
+                last_rows = await con.fetch("""
+                    SELECT DISTINCT ON (exchange, trade_type)
+                           exchange, trade_type, symbol, side,
+                           entry_price, exit_price, pnl_usd, closed_at,
+                           COALESCE(metadata::jsonb->>'exit_reason','') AS exit_reason,
+                           COALESCE(metadata::jsonb->>'fee_type','') AS fee_type
+                      FROM user_trades
+                     WHERE closed_at IS NOT NULL
+                       -- 2026-04-27 clean filter
+                       AND COALESCE(metadata::jsonb->>'exit_reason','')
+                           NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close')
+                       AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') != 'true' OR COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary')
+                     ORDER BY exchange, trade_type, closed_at DESC
+                """)
+                for r in last_rows:
+                    b = bucket_for(r["exchange"], r["trade_type"])
+                    out["last"][b] = {
+                        "symbol": r["symbol"], "side": r["side"],
+                        "entry_price": float(r["entry_price"]) if r["entry_price"] is not None else None,
+                        "exit_price":  float(r["exit_price"])  if r["exit_price"]  is not None else None,
+                        "pnl_usd":     float(r["pnl_usd"])     if r["pnl_usd"]     is not None else None,
+                        "closed_at":   r["closed_at"].isoformat() if r["closed_at"] else None,
+                        "exit_reason": r["exit_reason"], "fee_type": r["fee_type"],
+                    }
+
+                # 3. TODAY (last 24h) per-bucket aggregates
+                # 2026-04-27 clean filter — same as ACTIVE/LAST blocks above.
+                tod_rows = await con.fetch("""
+                    SELECT exchange, trade_type,
+                           COUNT(*) AS n,
+                           SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                           SUM(pnl_usd)::float AS pnl_total,
+                           SUM(fees_usd)::float AS fees
+                      FROM user_trades
+                     WHERE closed_at >= NOW() - INTERVAL '24 hours'
+                       AND closed_at IS NOT NULL
+                       AND COALESCE(metadata::jsonb->>'exit_reason','')
+                           NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close')
+                       AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') != 'true' OR COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary')
+                     GROUP BY exchange, trade_type
+                """)
+                for r in tod_rows:
+                    b = bucket_for(r["exchange"], r["trade_type"])
+                    n = int(r["n"] or 0); wins = int(r["wins"] or 0)
+                    out["today"][b] = {
+                        "n": n,
+                        "wr_pct": (wins / n * 100.0) if n else None,
+                        "pnl_total": float(r["pnl_total"] or 0),
+                        "fees": float(r["fees"] or 0),
+                    }
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
+
+    async def _handle_multi_exchange_closed(self, request: web.Request) -> web.Response:
+        """GET /api/multi-exchange/closed?bucket=paper|delta_shadow|bybit_shadow|bybit_demo
+                                          &days=N&limit=N&symbol=BTC/USDT
+        Powers the Analytics Trade History 4-tab unified component (Surface E).
+        Buckets map to (exchange, trade_type) tuples in user_trades.
+        """
+        bucket = (request.query.get("bucket") or "paper").lower()
+        try:
+            limit = max(1, min(2000, int(request.query.get("limit", "100"))))
+            days  = max(1, min(365,  int(request.query.get("days",  "7"))))
+        except Exception:
+            limit, days = 100, 7
+        symbol = request.query.get("symbol", "")
+
+        # bucket → (exchange, trade_type)
+        BUCKET_MAP = {
+            "paper":         (None,         "paper"),   # exchange-agnostic
+            "delta_shadow":  ("delta_india", "shadow"),
+            "delta_real":    ("delta_india", "real"),
+            "bybit_shadow":  ("bybit",       "shadow"),
+            "bybit_demo":    ("bybit",       "demo"),
+            "bybit_real":    ("bybit",       "real"),
+        }
+        if bucket not in BUCKET_MAP:
+            return web.json_response(
+                {"error": f"unknown bucket '{bucket}'", "valid": list(BUCKET_MAP.keys())},
+                status=400, dumps=_safe_dumps,
+            )
+        exchange, trade_type = BUCKET_MAP[bucket]
+
+        # 2026-04-27 PAPER FIX — paper signals live in closed_signals.json
+        # (file-based by design), NOT in user_trades. The DB query for
+        # trade_type='paper' returned 0 rows → TRADE HISTORY widget's
+        # PAPER tab showed empty even though 90+ paper signals close
+        # daily. Route bucket=paper to the same JSON-backed source as
+        # /api/paper/closed for consistency.
+        if bucket == "paper":
+            paper_signals = self._load_paper_signals("closed")
+            if symbol:
+                paper_signals = [s for s in paper_signals if s.get("symbol") == symbol]
+            if days > 0:
+                cutoff = datetime.utcnow() - timedelta(days=days)
+                paper_signals = [s for s in paper_signals
+                                 if s.get("exit_time") and self._parse_iso_safe(s["exit_time"]) >= cutoff]
+            paper_signals = paper_signals[-limit:]
+            paper_trades = [self._normalize_paper_trade(s) for s in paper_signals]
+            paper_out = {
+                "trades": paper_trades, "n": len(paper_trades),
+                "filters": {"bucket": "paper", "exchange": None, "trade_type": "paper",
+                            "limit": limit, "days": days, "symbol": symbol or None,
+                            "source": "closed_signals.json"},
+                "ts": datetime.utcnow().isoformat() + "Z",
+            }
+            if paper_trades:
+                paper_out["agg"] = self._aggregate_stats(paper_trades)
+            return web.json_response(paper_out, dumps=_safe_dumps)
+
+        out = {"trades": [], "n": 0,
+               "filters": {"bucket": bucket, "exchange": exchange,
+                           "trade_type": trade_type, "limit": limit, "days": days,
+                           "symbol": symbol or None},
+               "ts": datetime.utcnow().isoformat() + "Z"}
+        if not self._db_pool:
+            out["error"] = "db_pool_not_ready"
+            return web.json_response(out, dumps=_safe_dumps)
+
+        # 2026-04-27 — clean filter wired into the multi-exchange Trade
+        # History tab (last unfiltered API). Was contaminating the
+        # DELTA · SHADOW tab with 105 auto_responder_stuck_60m + 52
+        # reconcile_overaged_close + 25 restart_orphan_cleanup + 70+
+        # is_phase2_virtual fan-out trades, ballooning n=152→406 and
+        # net=-$12.86→-$86.31. Default clean=true; pass clean=false
+        # to see raw audit trail.
+        clean = request.query.get("clean", "true").lower() == "true"
+        out["filters"]["clean"] = clean
+        try:
+            async with self._db_pool.acquire() as con:
+                params = [trade_type]
+                where = ["trade_type = $1", "closed_at IS NOT NULL",
+                         f"closed_at >= NOW() - INTERVAL '{days} days'"]
+                if exchange is not None:
+                    params.append(exchange)
+                    where.append(f"exchange = ${len(params)}")
+                if symbol:
+                    params.append(symbol)
+                    where.append(f"symbol = ${len(params)}")
+                if clean:
+                    where.append(
+                        "COALESCE(metadata::jsonb->>'exit_reason','') "
+                        "NOT IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close')"
+                    )
+                    where.append(
+                        "(COALESCE(metadata::jsonb->>'is_phase2_virtual','false') != 'true' "
+                        " OR COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary')"
+                    )
+                sql = (f"SELECT * FROM user_trades WHERE " + " AND ".join(where)
+                       + f" ORDER BY closed_at DESC LIMIT {limit}")
+                rows = await con.fetch(sql, *params)
+                out["trades"] = [self._row_to_trade(r) for r in rows]
+                out["n"] = len(out["trades"])
+                # Aggregate quick stats so the UI can show header summary
+                if out["trades"]:
+                    out["agg"] = self._aggregate_stats(out["trades"])
+                # Surface excluded count for the UI footnote
+                if clean:
+                    excl_params = list(params)
+                    excl_where = ["trade_type = $1", "closed_at IS NOT NULL",
+                                  f"closed_at >= NOW() - INTERVAL '{days} days'"]
+                    if exchange is not None: excl_where.append(f"exchange = $2")
+                    if symbol:               excl_where.append(f"symbol = ${len(excl_params)}")
+                    excl_where.append(
+                        "(COALESCE(metadata::jsonb->>'exit_reason','') "
+                        " IN ('auto_responder_stuck_60m','restart_orphan_cleanup','reconcile_overaged_close') "
+                        " OR (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') = 'true' AND COALESCE(metadata::jsonb->>'exit_config_id','') != 'primary'))"
+                    )
+                    excl_sql = "SELECT COUNT(*)::int FROM user_trades WHERE " + " AND ".join(excl_where)
+                    out["excluded_n"] = int(await con.fetchval(excl_sql, *excl_params) or 0)
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return web.json_response(out, dumps=_safe_dumps)
 
     async def _handle_positions(self, request: web.Request) -> web.Response:
         async with self._lock:
@@ -1104,12 +2936,47 @@ class DashboardServer:
         return web.json_response(data, dumps=_safe_dumps)
 
     async def _handle_regime(self, request: web.Request) -> web.Response:
-        """Return current market regime and position sizing info."""
-        data = {"regime": "unknown", "action": {}, "early_exit_stats": {}}
+        """Return current market regime and position sizing info.
+
+        _last_regime_info is keyed by SYMBOL ({BTC/USDT: {...}, ...}).
+        Previously this handler returned the raw per-symbol dict which
+        the UI couldn't consume. Now returns a flat shape + per_symbol map.
+        """
+        data = {"regime": "unknown", "confidence": 0.0, "action": {}, "per_symbol": {}, "early_exit_stats": {}}
         if self._strategy and hasattr(self._strategy, '_scalp'):
             scalp = self._strategy._scalp
-            if hasattr(scalp, '_last_regime_info'):
-                data = scalp._last_regime_info
+            regime_info_all = getattr(scalp, '_last_regime_info', {}) or {}
+            if isinstance(regime_info_all, dict):
+                # Per-symbol regimes for the UI
+                per_symbol = {}
+                for sym, info in regime_info_all.items():
+                    if isinstance(info, dict):
+                        per_symbol[sym] = {
+                            "regime": info.get("regime", "unknown"),
+                            "regime_age": info.get("regime_age", 0),
+                            "action": info.get("action", {}),
+                            "indicators_snapshot": info.get("indicators_snapshot", {}),
+                        }
+                data["per_symbol"] = per_symbol
+
+                # Anchor: BTC else dominant
+                anchor = regime_info_all.get("BTC/USDT") or {}
+                if not anchor and regime_info_all:
+                    from collections import Counter as _C
+                    _regimes = [v.get("regime") for v in regime_info_all.values()
+                                if isinstance(v, dict) and v.get("regime")]
+                    if _regimes:
+                        anchor = {"regime": _C(_regimes).most_common(1)[0][0]}
+                data["regime"] = str(anchor.get("regime") or "unknown").lower()
+                data["action"] = anchor.get("action", {}) or {}
+                # Confidence from explicit field or regime_age
+                if anchor.get("confidence") is not None:
+                    data["confidence"] = round(float(anchor.get("confidence") or 0), 2)
+                else:
+                    _age = int(anchor.get("regime_age") or 0)
+                    data["confidence"] = 0.80 if _age >= 5 else (0.55 if _age >= 3 else (0.35 if _age >= 1 else 0.0))
+                data["anchor_symbol"] = "BTC/USDT" if regime_info_all.get("BTC/USDT") else "blend"
+
             # Early exit stats from tracker
             if self._signal_tracker:
                 closed = self._signal_tracker.get_closed_signals(limit=500)
@@ -1293,7 +3160,496 @@ class DashboardServer:
         )
 
     async def _handle_real_status(self, request: web.Request) -> web.Response:
-        """Return real trading manager status for dashboard."""
+        """Return real trading manager status for dashboard.
+
+        ROUTING (2026-04-20):
+        - If the caller has an authenticated session AND the orchestrator's
+          UserRealRegistry has a manager for them, return THEIR per-user
+          status (balance, positions, trades — all scoped to their Delta
+          account via their own keys).
+        - Otherwise fall back to the legacy global real_manager (currently
+          disabled — returns zeros).
+
+        Previously, every user hit the global /api/real/status and saw the
+        same numbers (zeros since legacy path disabled). Dashboard showed
+        "Deployable Capital: $0 no balance" to every user regardless of
+        their actual Delta testnet/prod balance. This proxy is transparent
+        to the frontend (no URL change, no JS rewrite needed) and the
+        per-user response shape matches the legacy shape.
+        """
+        # ── Per-user route (preferred) ──────────────────────────────
+        user_ctx = request.get("user") or {}
+        user_id = user_ctx.get("user_id")
+        if user_id:
+            orch = getattr(self, '_orchestrator', None)
+            user_registry = getattr(orch, '_user_registry', None) if orch else None
+            if user_registry:
+                try:
+                    # Try to find user_info in the cached active-users list
+                    user_info = None
+                    for u in (getattr(user_registry, '_active_users_cache', []) or []):
+                        if str(u.get("id")) == str(user_id):
+                            user_info = u
+                            break
+                    # If not in cache, refresh and retry
+                    if user_info is None:
+                        try:
+                            await user_registry._refresh_active_users()
+                            for u in (user_registry._active_users_cache or []):
+                                if str(u.get("id")) == str(user_id):
+                                    user_info = u
+                                    break
+                        except Exception:
+                            pass
+                    mgr = None
+                    try:
+                        if user_info is not None:
+                            mgr = await user_registry.get_or_create_manager(user_info)
+                        else:
+                            mgr = await user_registry.get_manager_for_user(str(user_id))
+                    except Exception as mgr_err:
+                        # CRITICAL DIAG: don't silently swallow — log loud
+                        logger.warning(
+                            "real_status: get_or_create_manager raised for user %s: %s",
+                            str(user_id)[:8], mgr_err,
+                        )
+                        mgr = None
+                    if user_info is not None and mgr is None:
+                        logger.info(
+                            "real_status: user %s (bot_mode=%s) in active_cache but manager=None — check keys",
+                            str(user_id)[:8], user_info.get("bot_mode"),
+                        )
+                    if mgr:
+                        try:
+                            await mgr.refresh_balance()
+                        except Exception:
+                            pass
+                        _status = mgr.get_status() if hasattr(mgr, 'get_status') else {}
+
+                        # ── Phase 4.2 UI wiring (2026-04-22) ──────────────
+                        # Pull this user's last 50 closed real trades from
+                        # user_trades table so the "RECENT CLOSED TRADES ›
+                        # REAL" tab has something to show. The in-memory
+                        # `closed_trades` list is cleared on every restart
+                        # and doesn't survive the bot lifecycle. DB is the
+                        # durable source of truth. Shape matches what
+                        # updateRealClosedTrades() in app.js expects:
+                        # {timestamp, symbol, side, entry_price, exit_price,
+                        #  margin, leverage, pnl_usd, pnl_pct, scanner,
+                        #  reason, slippage_bps}.
+                        try:
+                            pool = getattr(self, '_db_pool', None)
+                            if pool is not None:
+                                async with pool.acquire() as _conn:
+                                    _rows = await _conn.fetch(
+                                        """SELECT symbol, side, entry_price, exit_price,
+                                                  quantity, pnl_usd, status, opened_at,
+                                                  closed_at, metadata
+                                           FROM user_trades
+                                           WHERE user_id=$1 AND trade_type='real'
+                                             AND status='closed'
+                                             -- 2026-04-27 clean filter: drop admin/orphan/reconcile
+                                             -- closes (legacy 'orphan_reconciled' kept for compat).
+                                             AND COALESCE(metadata::jsonb->>'exit_reason','')
+                                                 NOT IN ('orphan_reconciled',
+                                                         'auto_responder_stuck_60m',
+                                                         'restart_orphan_cleanup',
+                                                         'reconcile_overaged_close')
+                                             AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') != 'true'
+                                                      OR COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary')
+                                           ORDER BY closed_at DESC
+                                           LIMIT 50""",
+                                        user_id,
+                                    )
+                                def _float(v, d=0.0):
+                                    try: return float(v) if v is not None else d
+                                    except Exception: return d
+                                _trades = []
+                                # Force UTC-anchored ISO strings so the JS
+                                # formatTime() → toLocaleTimeString(…, "Asia/Kolkata")
+                                # converts correctly to IST for every tab.
+                                # asyncpg returns tz-aware datetimes for
+                                # `timestamp with timezone` columns, but
+                                # promote to explicit UTC Z-suffix as
+                                # defence against any stripped-offset edge.
+                                from datetime import timezone as _tzmod
+                                def _iso_utc(dt):
+                                    if dt is None:
+                                        return ""
+                                    if dt.tzinfo is None:
+                                        dt = dt.replace(tzinfo=_tzmod.utc)
+                                    return dt.astimezone(_tzmod.utc).isoformat().replace("+00:00", "Z")
+
+                                for r in _rows:
+                                    m = r["metadata"] or {}
+                                    if isinstance(m, str):
+                                        try:
+                                            import json as __j
+                                            m = __j.loads(m)
+                                        except Exception:
+                                            m = {}
+                                    entry = _float(r["entry_price"])
+                                    exit_ = _float(r["exit_price"])
+                                    margin = _float(m.get("margin"))
+                                    lev = int(m.get("leverage") or 1)
+                                    pnl_usd = _float(r["pnl_usd"])
+                                    pnl_pct = 0.0
+                                    if entry > 0 and margin > 0 and lev > 0:
+                                        pnl_pct = (pnl_usd / (margin * lev)) * 100.0 if margin * lev > 0 else 0.0
+                                    _trades.append({
+                                        "timestamp": _iso_utc(r["closed_at"]),
+                                        "opened_at": _iso_utc(r["opened_at"]),
+                                        "closed_at": _iso_utc(r["closed_at"]),
+                                        "symbol": r["symbol"],
+                                        "side": r["side"],
+                                        "entry_price": entry,
+                                        "exit_price": exit_,
+                                        "margin": margin,
+                                        "leverage": lev,
+                                        "pnl_usd": pnl_usd,
+                                        "pnl_pct": pnl_pct,
+                                        "scanner": m.get("scanner") or "",
+                                        "reason": m.get("exit_reason") or "",
+                                        "slippage_bps": _float(m.get("slippage_bps")),
+                                        "phase": m.get("phase") or "",
+                                        "fee_type": m.get("fee_type") or "",
+                                        "grade": m.get("grade") or "",
+                                        "peak_mfe_r": _float(m.get("peak_mfe_r")),
+                                        "trade_type": m.get("trade_type") or "",
+                                    })
+                                # 3-tab UI (Phase 4.2): trades split into
+                                # demo_trades + live_trades by the EXCHANGE
+                                # they were routed to at trade-time. The
+                                # delta_client's `mode` at manager-creation
+                                # is the source of truth, recorded per-trade
+                                # in metadata → fee_type won't tell us, but
+                                # we persist `delta_mode` going forward. For
+                                # legacy rows (no tag), fall back to the
+                                # user's current bot_mode.
+                                user_mode = (user_info or {}).get("bot_mode", "demo") if user_info else "demo"
+                                demo_list, live_list = [], []
+                                for t in _trades:
+                                    # t.get("delta_mode") when populated; else
+                                    # fall back to current user_mode.
+                                    tm = (t.get("phase") or "")  # future: include delta_mode explicit
+                                    # No per-trade exchange label yet — route
+                                    # whole set to the user's current mode.
+                                    if user_mode == "live":
+                                        live_list.append(t)
+                                    else:
+                                        demo_list.append(t)
+                                _status["demo_trades"] = demo_list
+                                _status["live_trades"] = live_list
+                                _status["recent_trades"] = _trades  # back-compat
+                                _status["mode"] = user_mode  # let UI know
+
+                                # Phase 5.0.2 (2026-04-22) — DB-BACKED TRADE
+                                # STATS. Previous UI read `cb.trade_count_today`
+                                # and `cb.total_pnl` from the in-memory
+                                # CircuitBreaker, which resets on every bot
+                                # restart (bot restarted 5-6× today due to
+                                # deploys + auto-restart). UI showed
+                                # "Trades: 0, Total: $0" despite 12 real
+                                # trades per user in DB. Override with DB
+                                # truth so reality reflects what's persisted.
+                                _today_str = __import__('datetime').datetime.utcnow().strftime("%Y-%m-%d")
+                                _today_trades = [t for t in _trades if t["timestamp"].startswith(_today_str)]
+                                _today_net = sum(float(t.get("pnl_usd") or 0) for t in _today_trades)
+                                _today_wins = sum(1 for t in _today_trades if float(t.get("pnl_usd") or 0) > 0)
+                                _status["total_closed"] = len(_trades)
+                                _status["closed_today"] = len(_today_trades)
+                                _status["net_today"] = round(_today_net, 4)
+                                _status["wins_today"] = _today_wins
+
+                                # Inject DB truth into circuit_breaker so legacy
+                                # UI fields that read cb.trade_count_today /
+                                # cb.total_pnl show persisted data (not
+                                # post-restart zeros).
+                                _cb = _status.get("circuit_breaker") or {}
+                                _cb["trade_count_today"] = len(_today_trades)
+                                _cb["total_pnl"] = round(_today_net, 4)
+                                _cb["daily_pnl"] = round(_today_net, 4)
+                                _status["circuit_breaker"] = _cb
+
+                                # Last trade for the "LAST DEMO / LAST LIVE"
+                                # header card — pick most recent of the
+                                # user's mode-specific trades.
+                                _mode_list = demo_list if user_mode == "demo" else live_list
+                                if _mode_list:
+                                    _lt = _mode_list[0]  # already sorted DESC
+                                    _status["last_trade"] = {
+                                        "symbol": _lt.get("symbol"),
+                                        "side": _lt.get("side"),
+                                        "pnl_usd": _lt.get("pnl_usd"),
+                                        "reason": _lt.get("reason"),
+                                        "timestamp": _lt.get("timestamp"),
+                                    }
+
+                                # ── Track A (2026-04-25) — SHADOW trades ──
+                                # shadow_live is now the primary mode for
+                                # active users. Surface the user's last 10
+                                # closed shadow trades + a 24h aggregate so
+                                # the SHADOW tab + Analytics card have data.
+                                # Kept separate from demo/live above because
+                                # trade_type='shadow' is a different code
+                                # path (no exchange fills, synthetic exit
+                                # prices, but real signal lifecycle).
+                                _status["shadow_trades"] = []
+                                _status["shadow_stats_24h"] = {
+                                    "n": 0, "net_pnl": 0.0,
+                                    "avg_pnl": 0.0, "wins": 0, "win_rate": 0.0,
+                                }
+                                try:
+                                    async with pool.acquire() as _sconn:
+                                        _shadow_rows = await _sconn.fetch(
+                                            """SELECT symbol, side, entry_price, exit_price,
+                                                      quantity, pnl_usd, status, opened_at,
+                                                      closed_at, metadata
+                                               FROM user_trades
+                                               WHERE user_id=$1 AND trade_type='shadow'
+                                                 AND status='closed'
+                                                 -- 2026-04-27 clean filter: drop admin/orphan/reconcile
+                                                 -- closes + Phase 2 fan-out so RECENT CLOSED TRADES
+                                                 -- shows real strategy exits only.
+                                                 AND COALESCE(metadata::jsonb->>'exit_reason','')
+                                                     NOT IN ('auto_responder_stuck_60m',
+                                                             'restart_orphan_cleanup',
+                                                             'reconcile_overaged_close')
+                                                 AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') != 'true'
+                                                          OR COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary')
+                                               ORDER BY closed_at DESC
+                                               LIMIT 10""",
+                                            user_id,
+                                        )
+                                        _shadow_24h = await _sconn.fetchrow(
+                                            """SELECT COUNT(*)                              AS n,
+                                                      COALESCE(SUM(pnl_usd), 0)             AS net_pnl,
+                                                      COALESCE(AVG(pnl_usd), 0)             AS avg_pnl,
+                                                      COALESCE(SUM(CASE WHEN pnl_usd>0
+                                                                        THEN 1 ELSE 0 END), 0) AS wins
+                                               FROM user_trades
+                                               WHERE user_id=$1 AND trade_type='shadow'
+                                                 AND status='closed'
+                                                 AND closed_at >= NOW() - INTERVAL '24 hours'
+                                                 AND COALESCE(metadata::jsonb->>'exit_reason','')
+                                                     NOT IN ('auto_responder_stuck_60m',
+                                                             'restart_orphan_cleanup',
+                                                             'reconcile_overaged_close')
+                                                 AND (COALESCE(metadata::jsonb->>'is_phase2_virtual','false') != 'true'
+                                                          OR COALESCE(metadata::jsonb->>'exit_config_id','') = 'primary')""",
+                                            user_id,
+                                        )
+                                    _shadow_list = []
+                                    for r in _shadow_rows:
+                                        m = r["metadata"] or {}
+                                        if isinstance(m, str):
+                                            try:
+                                                import json as __j2
+                                                m = __j2.loads(m)
+                                            except Exception:
+                                                m = {}
+                                        entry = _float(r["entry_price"])
+                                        exit_ = _float(r["exit_price"])
+                                        margin = _float(m.get("margin"))
+                                        lev = int(m.get("leverage") or 1)
+                                        pnl_usd = _float(r["pnl_usd"])
+                                        pnl_pct = 0.0
+                                        if entry > 0 and margin > 0 and lev > 0:
+                                            pnl_pct = (pnl_usd / (margin * lev)) * 100.0 if margin * lev > 0 else 0.0
+                                        _shadow_list.append({
+                                            "timestamp":    _iso_utc(r["closed_at"]),
+                                            "opened_at":    _iso_utc(r["opened_at"]),
+                                            "closed_at":    _iso_utc(r["closed_at"]),
+                                            "symbol":       r["symbol"],
+                                            "side":         r["side"],
+                                            "entry_price":  entry,
+                                            "exit_price":   exit_,
+                                            "margin":       margin,
+                                            "leverage":     lev,
+                                            "pnl_usd":      pnl_usd,
+                                            "pnl_pct":      pnl_pct,
+                                            "scanner":      m.get("scanner") or "",
+                                            "reason":       m.get("exit_reason") or "",
+                                            "slippage_bps": _float(m.get("slippage_bps")),
+                                            "phase":        m.get("phase") or "",
+                                            "fee_type":     m.get("fee_type") or "",
+                                            "grade":        m.get("grade") or "",
+                                            "peak_mfe_r":   _float(m.get("peak_mfe_r")),
+                                            "trade_type":   "shadow",
+                                        })
+                                    _status["shadow_trades"] = _shadow_list
+                                    if _shadow_24h is not None:
+                                        _sn = int(_shadow_24h["n"] or 0)
+                                        _swins = int(_shadow_24h["wins"] or 0)
+                                        _status["shadow_stats_24h"] = {
+                                            "n":        _sn,
+                                            "net_pnl":  round(_float(_shadow_24h["net_pnl"]), 4),
+                                            "avg_pnl":  round(_float(_shadow_24h["avg_pnl"]), 4),
+                                            "wins":     _swins,
+                                            "win_rate": round((_swins / _sn) * 100.0, 2) if _sn > 0 else 0.0,
+                                        }
+                                except Exception as _shadow_err:
+                                    logger.debug(
+                                        "real_status shadow-history fetch failed for user %s: %s",
+                                        str(user_id)[:8], _shadow_err,
+                                    )
+                        except Exception as hist_err:
+                            logger.debug("real_status trade-history fetch failed: %s", hist_err)
+
+                        # Display-status derivation (same heuristic as legacy)
+                        try:
+                            _bal = float(_status.get("balance", 0) or 0)
+                            _open = int(_status.get("open_count", 0) or 0)
+                            _today = int(_status.get("closed_today", 0) or 0)
+                            _total = int(_status.get("total_closed", 0) or 0)
+                            _cb_tripped = bool(_status.get("circuit_breaker", {}).get("is_tripped", False))
+                            _enabled = bool(_status.get("enabled", True))
+                            _min_bal = 5.0
+                            if not _enabled:
+                                _status["display_status"] = "DISABLED"
+                            elif _cb_tripped:
+                                _status["display_status"] = "HALTED"
+                            elif _bal < _min_bal:
+                                _status["display_status"] = "STANDBY"
+                            elif _total == 0 and _today == 0 and _open == 0:
+                                _status["display_status"] = "ARMED"
+                            else:
+                                _status["display_status"] = "LIVE"
+                        except Exception:
+                            _status["display_status"] = _status.get("mode", "UNKNOWN")
+                        _status["scope"] = "user"
+                        _status["user_id"] = str(user_id)
+                        return web.json_response(_status)
+                except Exception as exc:
+                    logger.debug("per-user real-status lookup failed (%s) — falling back to global", exc)
+
+        # ── Paper-mode balance peek (2026-04-20) ─────────────────────
+        # Paper users don't have a UserRealManager (by design — paper is
+        # internal simulation, no exchange round-trip). But users still want
+        # to see their actual Delta balance as a vault-view reference.
+        # Run a lightweight read-only probe using the key MATCHING the user's
+        # bot_mode preference (demo user → demo key; paper user → live key if
+        # present, else demo). Cached 60s per user to avoid hammering Delta.
+        #
+        # BUGFIX 2026-04-21: this peek block used to run for ANY user (even
+        # demo/live) when the per-user manager path returned None or errored.
+        # It picked live > demo by default, which meant a demo user with only
+        # a live key on file (or whose manager failed to create) would see
+        # their live balance in the dashboard — confusing.
+        #
+        # New behavior:
+        #   - For paper users: peek picks live > demo (vault view)
+        #   - For demo users:  peek picks demo first
+        #   - For live users:  peek picks live first
+        # If the user's preferred-for-mode key is missing, fall back to the
+        # other label rather than showing nothing.
+        if user_id and self._db_pool:
+            import time as _time
+            now_sec = _time.time()
+            if not hasattr(self, '_balance_peek_cache'):
+                self._balance_peek_cache = {}  # user_id -> (ts, payload)
+            cached = self._balance_peek_cache.get(str(user_id))
+            if cached and (now_sec - cached[0]) < 60.0:
+                peek_payload = dict(cached[1])
+                peek_payload["cache_age_sec"] = int(now_sec - cached[0])
+                return web.json_response(peek_payload)
+
+            try:
+                async with self._db_pool.acquire() as conn:
+                    user_row = await conn.fetchrow(
+                        "SELECT bot_mode FROM users WHERE id = $1", user_id,
+                    )
+                    # Mode-aware priority: demo user → demo key first; live
+                    # user → live first; paper user → live first (vault view).
+                    cur_mode = (user_row["bot_mode"] if user_row else "paper") or "paper"
+                    if cur_mode == "demo":
+                        priority_sql = "ORDER BY CASE label WHEN 'demo' THEN 1 WHEN 'live' THEN 2 ELSE 3 END"
+                    else:
+                        priority_sql = "ORDER BY CASE label WHEN 'live' THEN 1 WHEN 'demo' THEN 2 ELSE 3 END"
+                    key_row = await conn.fetchrow(
+                        f"""SELECT label, api_key_enc, api_secret_enc, base_url
+                            FROM user_api_keys
+                            WHERE user_id = $1 AND exchange = 'delta' AND is_active = TRUE
+                            {priority_sql}
+                            LIMIT 1""",
+                        user_id,
+                    )
+            except Exception:
+                user_row = None
+                key_row = None
+
+            if user_row and key_row:
+                label = key_row["label"]
+                try:
+                    from auth.crypto import decrypt_api_key
+                    api_key = decrypt_api_key(key_row["api_key_enc"], user_id=str(user_id))
+                    api_secret = decrypt_api_key(key_row["api_secret_enc"], user_id=str(user_id))
+                    base_url = key_row["base_url"] or (
+                        "https://cdn-ind.testnet.deltaex.org" if label == "demo"
+                        else "https://api.india.delta.exchange"
+                    )
+                except Exception:
+                    api_key = api_secret = base_url = None
+
+                probe_balance = None
+                if api_key and api_secret:
+                    import asyncio as _asyncio
+                    from exchange.delta_balance import fetch_usd_balance
+                    def _peek():
+                        try:
+                            return fetch_usd_balance(api_key, api_secret, base_url)
+                        except Exception as e:
+                            logger.debug("balance peek failed: %s", e)
+                            return None
+                    try:
+                        probe_balance = await _asyncio.to_thread(_peek)
+                    except Exception:
+                        probe_balance = None
+
+                # Derive display_status honestly:
+                #   paper mode → STANDBY (armed with key, not trading)
+                #   demo mode  → ARMED   (real trading eligible, zero activity yet)
+                #   live mode  → ARMED   (same — peek means manager wasn't available)
+                # "DISABLED" only when balance probe failed (key rejected / unreachable)
+                _bot_mode = user_row["bot_mode"] or "paper"
+                _bal_known = probe_balance is not None
+                if not _bal_known:
+                    _display_status = "DISABLED"
+                elif _bot_mode == "paper":
+                    _display_status = "STANDBY"
+                else:
+                    _display_status = "ARMED"
+                peek_payload = {
+                    "enabled": _bot_mode != "paper",
+                    "dry_run": _bot_mode == "demo",
+                    "mode": _bot_mode,
+                    "display_status": _display_status,
+                    "balance": round(probe_balance, 2) if _bal_known else 0.0,
+                    "balance_source": f"peek_{label}" if _bal_known else "unreachable",
+                    "balance_peek": True,       # flag: not from a live UserRealManager
+                    "trading_active": _bot_mode != "paper",
+                    "key_label": label,
+                    "circuit_breaker": {"daily_pnl": 0, "is_tripped": False},
+                    "open_positions": [], "open_count": 0,
+                    "closed_today": 0, "total_closed": 0,
+                    "recent_trades": [],
+                    "scope": "user_peek",
+                    "user_id": str(user_id),
+                    "note": (
+                        f"Paper mode — read-only balance from {label} key."
+                        if _bot_mode == "paper"
+                        else f"Balance from {label} key. Manager will take over for trading signals."
+                    ),
+                    "cache_age_sec": 0,
+                }
+                self._balance_peek_cache[str(user_id)] = (now_sec, peek_payload)
+                return web.json_response(peek_payload)
+
+        # ── Legacy global fallback — retired 2026-04-20 ─────────────
+        # RealManager no longer instantiated (main.py sets real_manager=None).
+        # This block remains so any very old callers without a session still
+        # get a structurally-valid empty payload rather than an error. After
+        # one release cycle, the `if mgr:` branch can be deleted entirely.
         mgr = getattr(self, '_real_manager', None)
         if not mgr:
             orch = getattr(self, '_orchestrator', None)
@@ -1334,11 +3690,37 @@ class DashboardServer:
                 # Orphan cleanup now happens only in orchestrator on a 5-min timer.
             except Exception:
                 pass
-            return web.json_response(mgr.get_status())
+            # UI FIX (2026-04-16): derive honest display_status that reflects
+            # reality (LIVE implied actively trading; reality might be "armed
+            # but $2.99 balance, zero real trades ever").
+            _status = mgr.get_status()
+            try:
+                _enabled = bool(_status.get("enabled", False))
+                _balance = float(_status.get("balance", 0) or 0)
+                _open = int(_status.get("open_count", 0) or 0)
+                _today = int(_status.get("closed_today", 0) or 0)
+                _total = int(_status.get("total_closed", 0) or 0)
+                _cb_tripped = bool(_status.get("circuit_breaker", {}).get("is_tripped", False))
+                _min_bal = 5.0  # USDT — below this no meaningful trade size possible
+
+                if not _enabled:
+                    _status["display_status"] = "DISABLED"
+                elif _cb_tripped:
+                    _status["display_status"] = "HALTED"
+                elif _balance < _min_bal:
+                    _status["display_status"] = "STANDBY"  # armed but underfunded
+                elif _total == 0 and _today == 0 and _open == 0:
+                    _status["display_status"] = "ARMED"    # armed, no activity yet
+                else:
+                    _status["display_status"] = "LIVE"
+            except Exception:
+                _status["display_status"] = _status.get("mode", "UNKNOWN")
+            return web.json_response(_status)
         return web.json_response({
             "enabled": False,
             "dry_run": True,
             "mode": "DISABLED",
+            "display_status": "DISABLED",
             "balance": 0,
             "circuit_breaker": {"daily_pnl": 0, "is_tripped": False},
             "open_positions": [],
@@ -1349,45 +3731,24 @@ class DashboardServer:
         })
 
     async def _handle_real_toggle(self, request: web.Request) -> web.Response:
-        """Toggle real trading on/off from dashboard."""
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        enabled = body.get("enabled")
-        dry_run = body.get("dry_run")
+        """RETIRED 2026-04-20 (Option-A consolidation).
 
-        orch = getattr(self, '_orchestrator', None)
-        mgr = None
-        if hasattr(self, '_real_manager') and self._real_manager:
-            mgr = self._real_manager
-        elif orch and hasattr(orch, '_real_manager') and orch._real_manager:
-            mgr = orch._real_manager
+        The legacy shared-account RealTradingManager is no longer the source
+        of truth. Mode changes go through /api/user/real/toggle which writes
+        users.bot_mode (PostgreSQL) per-user and validates that a matching
+        API key exists.
 
-        if not mgr:
-            return web.json_response({"error": "Real trading manager not initialized"}, status=400)
-
-        if enabled is not None:
-            mgr.enabled = bool(enabled)
-            logger.warning("REAL TRADING %s via dashboard", "ENABLED" if mgr.enabled else "DISABLED")
-        if dry_run is not None:
-            old_dry_run = mgr.dry_run
-            mgr.dry_run = bool(dry_run)
-            logger.warning("REAL TRADING dry_run=%s via dashboard", mgr.dry_run)
-            # Reset circuit breaker when switching modes (dry→live or live→dry)
-            if old_dry_run != mgr.dry_run:
-                mgr.circuit_breaker.daily_pnl = 0
-                mgr.circuit_breaker.total_pnl = 0
-                mgr.circuit_breaker.consecutive_losses = 0
-                mgr.circuit_breaker.is_tripped = False
-                mgr.circuit_breaker.trip_reason = ""
-                mgr.circuit_breaker.trade_count_today = 0
-                logger.warning("REAL TRADING: Circuit breaker RESET on mode switch (%s → %s)",
-                             "dry_run" if old_dry_run else "live",
-                             "dry_run" if mgr.dry_run else "live")
-
-        mgr._save_state()
-        return web.json_response(mgr.get_status())
+        Returning 410 Gone so any stale JS hitting this endpoint is forced
+        to fail loudly rather than silently write state the system ignores.
+        Front-end dropdown was re-wired in commit 2e5f6d5 to target the
+        per-user endpoint instead.
+        """
+        return web.json_response({
+            "error": "gone",
+            "reason": "Legacy shared-account toggle removed — trading mode is per-user now.",
+            "replacement": "POST /api/user/real/toggle with {bot_mode: 'paper'|'demo'|'live'}",
+            "hint": "Use /profile → Trading → Mode Readiness card, or admin force-mode.",
+        }, status=410)
 
     async def _handle_emergency_stop(self, request: web.Request) -> web.Response:
         """KILL SWITCH: Stop all trading immediately."""
@@ -2290,15 +4651,28 @@ class DashboardServer:
             if not tracker and orch:
                 tracker = getattr(orch, '_signal_tracker', None)
 
-            # Regime from strategy
-            regime_info = {}
+            # Regime from strategy — _last_regime_info is keyed by symbol.
+            # Use BTC as anchor, else dominant across symbols.
+            regime_info_all = {}
             try:
-                regime_info = getattr(scalp, '_last_regime_info', {}) or {}
+                regime_info_all = getattr(scalp, '_last_regime_info', {}) or {}
             except Exception:
                 pass
 
-            regime = str(regime_info.get("regime", "unknown")).lower()
-            regime_conf = float(regime_info.get("confidence", 0) or 0)
+            _anchor = regime_info_all.get("BTC/USDT") or {}
+            if not _anchor and regime_info_all:
+                from collections import Counter as _C
+                _r = [v.get("regime") for v in regime_info_all.values() if isinstance(v, dict) and v.get("regime")]
+                if _r:
+                    _anchor = {"regime": _C(_r).most_common(1)[0][0]}
+
+            regime = str(_anchor.get("regime") or "unknown").lower()
+            # Confidence: prefer explicit, else derive from regime_age
+            if _anchor.get("confidence") is not None:
+                regime_conf = float(_anchor.get("confidence") or 0)
+            else:
+                _age = int(_anchor.get("regime_age") or 0)
+                regime_conf = 0.80 if _age >= 5 else (0.55 if _age >= 3 else (0.35 if _age >= 1 else 0.0))
 
             # Recent performance (last 20 trades) for thesis direction
             recent_trades = []
@@ -2504,20 +4878,56 @@ class DashboardServer:
                 except Exception:
                     pass
 
-            # Regime transition detection (compare recent regime vs historical)
+            # Regime transition detection — _last_regime_info is keyed by symbol:
+            #   { "BTC/USDT": {"regime": "...", "regime_age": int, ...}, ... }
+            # Build dominant regime from per-symbol observations, weighted by BTC as anchor.
             transitions = []
             try:
                 orch = getattr(self, '_orchestrator', None)
                 strategy = getattr(orch, '_strategy', None) if orch else None
                 scalp = getattr(strategy, '_scalp', strategy) if strategy else None
-                regime_info = getattr(scalp, '_last_regime_info', {}) or {}
-                current_regime = str(regime_info.get("regime", "unknown")).lower()
-                # Simple transition: flag if regime changed recently
+                regime_info_all = getattr(scalp, '_last_regime_info', {}) or {}
+
+                # Prefer BTC/USDT as market anchor; else most common regime across symbols
+                anchor = regime_info_all.get("BTC/USDT") or {}
+                if not anchor and regime_info_all:
+                    # Take the most recent/populated entry
+                    from collections import Counter as _C
+                    _regimes = [v.get("regime") for v in regime_info_all.values() if isinstance(v, dict) and v.get("regime")]
+                    if _regimes:
+                        _dominant = _C(_regimes).most_common(1)[0][0]
+                        anchor = {"regime": _dominant}
+
+                current_regime = str(anchor.get("regime") or "unknown").lower()
+
+                # Confidence proxy: higher regime_age = more stable.
+                # age >= 5 bars = stable (conf 0.8), age < 3 = transitioning (conf 0.3)
+                _age = int(anchor.get("regime_age") or 0)
+                if _age >= 5:
+                    _conf = 0.80
+                    _signal = "stable"
+                elif _age >= 3:
+                    _conf = 0.55
+                    _signal = "stable"
+                elif _age >= 1:
+                    _conf = 0.35
+                    _signal = "transitioning"
+                else:
+                    _conf = 0.0
+                    _signal = "transitioning"
+
+                # If explicit confidence is provided by the detector, prefer it.
+                if anchor.get("confidence") is not None:
+                    _conf = round(float(anchor.get("confidence")), 2)
+                    _signal = "stable" if _conf > 0.7 else "transitioning"
+
                 transitions.append({
                     "type": "regime",
                     "current": current_regime,
-                    "signal": "stable" if regime_info.get("confidence", 0) > 0.7 else "transitioning",
-                    "confidence": round(float(regime_info.get("confidence", 0) or 0), 2),
+                    "signal": _signal,
+                    "confidence": round(_conf, 2),
+                    "age_bars": _age,
+                    "anchor_symbol": "BTC/USDT" if regime_info_all.get("BTC/USDT") else "blend",
                 })
             except Exception:
                 pass

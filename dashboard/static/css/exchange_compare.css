@@ -1,0 +1,131 @@
+/* Exchange Compare tab — Delta India vs Bybit (vs Paper)
+ * 2026-04-26
+ */
+.xc-panel {
+  background: var(--bg-card, #0f1524);
+  border: 1px solid var(--border, rgba(255,255,255,0.06));
+  border-radius: 6px;
+  padding: 16px 18px;
+  margin-bottom: 14px;
+  font-family: var(--font-mono, monospace);
+  font-variant-numeric: tabular-nums;
+}
+
+.xc-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+.xc-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--text-primary, #e8eef9);
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+}
+.xc-controls { display: flex; gap: 10px; align-items: center; }
+.xc-sel {
+  background: var(--bg-input, #060912);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  padding: 3px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.xc-grid {
+  display: grid;
+  grid-template-columns: 200px repeat(3, 1fr);
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  font-size: 0.78rem;
+}
+
+.xc-cell {
+  padding: 10px 14px;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.xc-cell:nth-child(4n) { border-right: none; }
+.xc-grid > .xc-cell:nth-last-child(-n+4) { border-bottom: none; }
+
+.xc-cell--header {
+  background: var(--bg-card-elevated, #161e34);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+  color: var(--text-secondary, #9ca8be);
+  text-align: center;
+}
+.xc-cell--header:first-child { text-align: left; padding-left: 14px; }
+
+.xc-cell--metric {
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+  color: var(--text-tertiary, #6b7794);
+  background: var(--bg-card, #0f1524);
+}
+
+.xc-cell--val {
+  text-align: right;
+  font-weight: 500;
+  color: var(--text-primary, #e8eef9);
+}
+.xc-cell--val[data-na="1"] { color: var(--text-tertiary); font-style: italic; }
+.xc-cell--val--ok      { color: var(--success, #22c55e); }
+.xc-cell--val--danger  { color: var(--danger,  #ef4444); }
+.xc-cell--val--warn    { color: var(--warning, #f59e0b); }
+
+.xc-cell--win {
+  background: rgba(34, 197, 94, 0.06);
+  border-left: 2px solid var(--success);
+}
+
+.xc-verdict {
+  margin-top: 14px;
+  padding: 12px 16px;
+  background: var(--accent-soft, rgba(0,212,168,0.08));
+  border-left: 3px solid var(--accent, #00d4a8);
+  border-radius: 4px;
+  font-size: 0.82rem;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+.xc-verdict strong {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.xc-empty {
+  font-size: 0.78rem;
+  font-style: italic;
+  color: var(--text-tertiary);
+  padding: 12px 0;
+  text-align: center;
+}
+.xc-paper-row {
+  margin-top: 10px;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+.xc-paper-row strong { color: var(--text-primary); margin: 0 4px; font-weight: 600; }
+
+@media (max-width: 900px) {
+  .xc-grid { grid-template-columns: 130px repeat(3, 1fr); }
+  .xc-cell { padding: 8px 8px; font-size: 0.7rem; }
+}

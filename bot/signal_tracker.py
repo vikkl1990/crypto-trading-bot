@@ -24,6 +24,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Phase 5.8 (2026-04-25) — Unified dead-signal guard.
+# Replaces the early_kill / dead_market / zombie cascade with one fee-floor
+# + ATR-grace function. See docs/EXIT_GUARD_REFACTOR_5_8.md.
+from execution.exit_guards import should_kill_dead_signal
+
 logger = logging.getLogger(__name__)
 
 _STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage"
@@ -338,10 +343,15 @@ class TrackedSignal:
         # ── FIXED FRACTIONAL RISK MODEL ──
         # Risk 0.75% of account per trade (constant dollar risk)
         # This automatically sizes positions based on SL distance
-        ACCOUNT_SIZE = 1000.0  # paper account base
-        MAX_MARGIN_PER_TRADE = 100.0  # max $100 margin (stake) per trade
+        # Phase 5.6-D (2026-04-24) — PAPER MARGIN FLOOR RAISE.
+        # Paper was using $50-$100 stake. Raising floor to $150-$200 across
+        # all confidence tiers so paper trades are more representative of
+        # real capital allocation on a larger account. Keeps risk budget
+        # proportional (ACCOUNT_SIZE raised 2x to maintain 0.75% risk rule).
+        ACCOUNT_SIZE = 2000.0  # paper account base (was $1000)
+        MAX_MARGIN_PER_TRADE = 200.0  # max $200 margin per trade (was $100)
         RISK_PCT = 0.75        # risk 0.75% per trade
-        risk_amount = ACCOUNT_SIZE * RISK_PCT / 100  # $7.50 risk per trade
+        risk_amount = ACCOUNT_SIZE * RISK_PCT / 100  # $15.00 risk per trade
 
         # Position size = risk / SL_distance
         # If SL is 0.5% away, position = $7.50 / 0.005 = $1500
@@ -351,28 +361,30 @@ class TrackedSignal:
         else:
             position_usd = risk_amount * 100  # fallback
 
-        # ── SUPER SCALP LEVERAGE (10x-50x, $100-$200 margin) ──
-        # Minimum $200 position to survive fee drag. Fewer but larger trades.
-        # Liquidation safety checked separately in strategy
+        # ── SUPER SCALP LEVERAGE (10x-75x, $150-$200 margin) ──
+        # Phase 5.6-D — paper margin floor raised $50-$100 → $150-$200
+        # across all confidence tiers. More representative of real capital
+        # allocation. Larger positions mean fees become proportionally
+        # smaller vs gross, better reflecting live economics.
         if confidence >= 90:
             max_lev = 75
-            paper_stake = 100.0
+            paper_stake = 200.0   # was 100
             lev_cap_source = "super_scalp_90+_75x"
         elif confidence >= 80:
             max_lev = 60
-            paper_stake = 100.0
+            paper_stake = 185.0   # was 100
             lev_cap_source = "super_scalp_80+_60x"
         elif confidence >= 70:
             max_lev = 45
-            paper_stake = 80.0
+            paper_stake = 175.0   # was 80
             lev_cap_source = "super_scalp_70+_45x"
         elif confidence >= 60:
             max_lev = 30
-            paper_stake = 60.0
+            paper_stake = 165.0   # was 60
             lev_cap_source = "super_scalp_60+_30x"
         else:
             max_lev = 20
-            paper_stake = 50.0
+            paper_stake = 150.0   # was 50 — NEW FLOOR
             lev_cap_source = "super_scalp_base_20x"
 
         # Derive effective leverage from position size
@@ -475,28 +487,30 @@ class TrackedSignal:
         # Extract ATR from signal metadata for trailing stop
         signal_atr = float(meta.get("atr", 0))
 
-        # ── FIX: ZERO ATR GUARD ──
-        # DOT/USDT 2026-04-12 loss: ATR was 0.0, chandelier trail couldn't
-        # tighten (0 × multiplier = 0). Trade went +0.40R then reversed to SL.
-        # If ATR is zero, the entire trail system is blind. Block the trade.
+        # ── ZERO ATR FALLBACK (Silent Failure #14 fix, 2026-04-26) ──
+        # Original behavior: block the trade entirely (sentinel with entry=0).
+        # Problem: this killed the entire 7d shadow validation window when ATR
+        # cache went stale. ZERO ATR was firing for XRP/ADA, blocking 12+ signals.
+        # New behavior: use a CONSERVATIVE fallback ATR (0.5% of entry price)
+        # so the trail system has SOMETHING to work with. This is safe because:
+        #   - Chandelier multiplier × 0.5% = real, finite trail step
+        #   - The trade still has its hard SL from the strategy
+        #   - Under-trailing < not-trading-at-all when in shadow validation
+        # Logs WARNING so it's not silent.
         if signal_atr <= 0 and entry > 0:
+            fallback_atr = entry * 0.005  # 0.5% of entry as conservative fallback
             logger.warning(
-                "ZERO ATR BLOCK: %s %s | atr=%.6f — trail system blind, blocking trade",
-                sig.get("symbol", ""), sig.get("side", ""), signal_atr,
+                "ZERO ATR FALLBACK: %s %s | upstream atr=0 → using 0.5%% fallback (%.6f). "
+                "Trail tighter than ideal but trade allowed. Investigate upstream ATR cache.",
+                sig.get("symbol", ""), sig.get("side", ""), fallback_atr,
             )
             try:
                 from bot import pipeline_metrics as _pm
-                _pm.record_hotfix_veto("p7_zero_atr_block", f"{sig.get('symbol', '?')}_{sig.get('side', '?')}")
+                _pm.record_hotfix_veto("p7_zero_atr_fallback", f"{sig.get('symbol', '?')}_{sig.get('side', '?')}")
             except Exception:
                 pass
-            # Return a sentinel TrackedSignal with zero prices so track_signal's
-            # existing `if not ts.entry_price` check will gracefully skip it.
-            # Previously returned [] (list) which broke caller's .entry_price access.
-            return cls(
-                trade_id=f"blocked_{sig.get('symbol', '?')}_{int(__import__('time').time())}",
-                symbol=sig.get("symbol", ""), side=sig.get("side", "long"),
-                entry_price=0.0, stop_loss=0.0,
-            )
+            signal_atr = fallback_atr
+            # Continue normally — DO NOT return sentinel
 
         # ── MINIMUM POSITION SIZE ENFORCEMENT ──
         # Positions below $50 have fee ratios too high for any edge to survive
@@ -551,7 +565,35 @@ class TrackedSignal:
             order_type=_order_type,
         )
 
-        if fee_check["fee_drag_r"] > 0.8:  # hard block: fees consume >80% of risk
+        # ── G1 fix (2026-04-26): SHADOW-PERMISSIVE fee gate ──
+        # Fees are SIMULATED in shadow mode (no exchange fees actually charged).
+        # When all users are in shadow_live, the fee gate would block 100% of
+        # signals on tight setups — which is what we want to MEASURE in shadow,
+        # not pre-filter. Real-mode keeps both gates exactly as before.
+        try:
+            from execution import shadow_mode_flag as _smf
+            _shadow_only = _smf.is_all_users_shadow()
+        except Exception:
+            _shadow_only = False
+
+        if _shadow_only:
+            # Shadow window: fee gates DO log (audit trail) but DO NOT zero confidence
+            if fee_check["fee_drag_r"] > 0.8:
+                logger.info(
+                    "FEE BLOCK SHADOW-PERMIT: %s %s | fee_drag=%.2fR (>0.8) — "
+                    "would block in real, allowed in shadow for measurement",
+                    sig.get("symbol", ""), sig.get("side", ""),
+                    fee_check["fee_drag_r"],
+                )
+                # confidence unchanged → signal proceeds
+            elif not fee_check["viable"]:
+                logger.info(
+                    "FEE BLOCK SHADOW-PERMIT: %s %s | fee_drag=%.2fR (>0.6) — "
+                    "soft-block bypassed in shadow",
+                    sig.get("symbol", ""), sig.get("side", ""),
+                    fee_check["fee_drag_r"],
+                )
+        elif fee_check["fee_drag_r"] > 0.8:  # hard block: fees consume >80% of risk
             # Fees > 50% of risk = negative EV by definition — hard block
             logger.warning(
                 "FEE BLOCK: %s %s | fee_drag=%.2fR (>0.8) | min_move=%.3f%% | "
@@ -592,9 +634,14 @@ class TrackedSignal:
                 _regime_str = str(meta.get("regime", "") or "").lower()
                 _chop_regime = _regime_str in ("high_volatility", "sideways", "ranging", "quiet")
                 _short_type = pre_trade_type in (TRADE_TYPE_SCALP, TRADE_TYPE_INTRADAY)
-                if _fdr > 0.30 and _short_type and _chop_regime:
+                # Phase 4.3 (2026-04-22) — Lever B: P4 fee-drag threshold
+                # relaxed 0.30 → 0.40. Observed 2026-04-22 AM: six A+ scalps
+                # blocked at fee_drag 0.31-0.41R while paper captured all of
+                # them at +0.20-0.32% trail_profit. Threshold was too tight.
+                # Universal fee cap at 0.50R still protects worst-case fees.
+                if _fdr > 0.40 and _short_type and _chop_regime:
                     logger.warning(
-                        "FEE BLOCK P4: %s %s %s | fee_drag=%.2fR (>0.30) | regime=%s | "
+                        "FEE BLOCK P4: %s %s %s | fee_drag=%.2fR (>0.40) | regime=%s | "
                         "pos=$%.0f sl=%.3f%% — chop+scalp can't overcome fees, blocked",
                         sig.get("symbol", ""), sig.get("side", ""), pre_trade_type,
                         _fdr, _regime_str, position_usd, sl_dist_pct,
@@ -613,13 +660,17 @@ class TrackedSignal:
             # ── FIX B: UNIVERSAL fee_drag cap for ALL trade types ──
             # Weekend 2026-04-12: 98.8% fee/gross ratio. RUNNER trades with
             # fee_drag=0.40-0.52 bypassed the P4 chop filter (which only applies
-            # to SCALP/INTRADAY). Add a hard universal cap at 0.50 — no trade
-            # type can justify >50% of risk going to fees.
+            # to SCALP/INTRADAY). Add a hard universal cap — no trade type
+            # can justify fees above the cap.
+            # Phase 4.5 (2026-04-22) — cap 0.50 → 0.60. Observed 3 paper
+            # trail_profit winners today in the 0.50-0.60 band (05:24 SOL A+,
+            # 09:57 SOL, 10:54 SOL). Canary G7 guards rollback if Phase 4.5
+            # cohort degrades WR vs Phase 4.1 baseline (50% WR).
             try:
                 _fdr = float(fee_check.get("fee_drag_r", 0) or 0)
-                if _fdr > 0.50 and confidence > 0:
+                if _fdr > 0.60 and confidence > 0:
                     logger.warning(
-                        "FEE CAP: %s %s | fee_drag=%.2fR (>0.50 universal) | type=%s — blocked",
+                        "FEE CAP: %s %s | fee_drag=%.2fR (>0.60 universal) | type=%s — blocked",
                         sig.get("symbol", ""), sig.get("side", ""), _fdr, pre_trade_type,
                     )
                     confidence = 0
@@ -843,7 +894,18 @@ class SignalTracker:
                 return
 
         # ── SETUP STRENGTH VETO: reject weak setups that tend to timeout ──
+        # Silent Failure #14 fix (2026-04-26): when bot is in shadow_live mode
+        # globally (no real money at risk), permit weaker setups so the shadow
+        # window collects data on what would happen. Real-mode keeps the gate.
         MIN_SETUP_STRENGTH = 40  # Lowered: funnel already filters weak setups
+        # Permissive override for shadow validation period
+        try:
+            from execution import shadow_mode_flag
+            _is_shadow_only = shadow_mode_flag.is_all_users_shadow()
+        except Exception:
+            _is_shadow_only = False
+        if _is_shadow_only:
+            MIN_SETUP_STRENGTH = 25  # was 40 — permissive in shadow
         meta = signal_dict.get("metadata", {})
         setup_score = meta.get("weighted_score", 0)
         if setup_score and setup_score < MIN_SETUP_STRENGTH:
@@ -851,6 +913,14 @@ class SignalTracker:
                 "WEAK SETUP BLOCKED: %s %s %s | score=%.0f < %d — likely to timeout",
                 ts.trade_id[:8], ts.symbol, ts.side, setup_score, MIN_SETUP_STRENGTH,
             )
+            # Silent Failure #14 fix: stamp the journey so we know WHY it died
+            try:
+                from bot.signal_journey import SignalJourney as _SJ
+                _SJ.stamp(signal_dict, "signal_tracker", passed=False,
+                         reason=f"weak_setup_score_{int(setup_score)}_lt_{MIN_SETUP_STRENGTH}")
+                _SJ.close(signal_dict)
+            except Exception:
+                pass
             return
 
         # ── DUPLICATE PREVENTION: no re-entry at same price within 30 min ──
@@ -1046,13 +1116,15 @@ class SignalTracker:
             is_long = ts.side == "long"
 
             # Update MAE/MFE in R-multiples (live tracking)
+            # HONEST_PAPER_5_22_BIAS1 — anchor on fill_price (with fallback)
             if ts.initial_risk > 0:
+                _mfe_basis = ts.fill_price if (ts.fill_price and ts.fill_price > 0) else ts.entry_price
                 if is_long:
-                    fav = (ts.highest_price - ts.entry_price) / ts.initial_risk
-                    adv = (ts.entry_price - ts.lowest_price) / ts.initial_risk
+                    fav = (ts.highest_price - _mfe_basis) / ts.initial_risk
+                    adv = (_mfe_basis - ts.lowest_price) / ts.initial_risk
                 else:
-                    fav = (ts.entry_price - ts.lowest_price) / ts.initial_risk
-                    adv = (ts.highest_price - ts.entry_price) / ts.initial_risk
+                    fav = (_mfe_basis - ts.lowest_price) / ts.initial_risk
+                    adv = (ts.highest_price - _mfe_basis) / ts.initial_risk
                 ts.mfe_r = round(max(ts.mfe_r, fav), 4)
                 ts.mae_r = round(max(ts.mae_r, adv), 4)
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -1061,10 +1133,12 @@ class SignalTracker:
             # Force close if adverse excursion exceeds 1.2R (tightened from 2R)
             # Prevents -1.7R catastrophic losses seen in last 24h
             if ts.initial_risk > 0:
+                # HONEST_PAPER_5_22_BIAS1 — anchor on fill_price (with fallback)
+                _adv_basis = ts.fill_price if (ts.fill_price and ts.fill_price > 0) else ts.entry_price
                 if is_long:
-                    current_adverse_r = (ts.entry_price - price) / ts.initial_risk
+                    current_adverse_r = (_adv_basis - price) / ts.initial_risk
                 else:
-                    current_adverse_r = (price - ts.entry_price) / ts.initial_risk
+                    current_adverse_r = (price - _adv_basis) / ts.initial_risk
                 if current_adverse_r >= 1.2:
                     ts.exit_price = price
                     ts.exit_reason = "hard_loss_cap"
@@ -1165,9 +1239,29 @@ class SignalTracker:
             sl_hit = (price <= ts.stop_loss) if is_long else (price >= ts.stop_loss)
             if sl_hit and not ts.sl_hit:
                 ts.sl_hit = True
-                ts.exit_price = price
+                # BUGFIX 2026-04-20: when BE has locked profit (SL moved into
+                # profit zone past entry), a fast reversal can tick the check
+                # AFTER price has already crossed the SL level. Using `price`
+                # here would exit at the post-crossing tick (a loss), defeating
+                # the locked-profit guarantee. Honor the SL price as the exit
+                # when the SL is in the profit zone — this matches what a
+                # proper stop order would fill at (bounded slippage at SL).
+                #
+                # Condition: BE is set AND SL is on the profit side of entry.
+                # For shorts, SL <= entry means the lock moved below entry.
+                # For longs, SL >= entry means the lock moved above entry.
+                # Otherwise (bare SL hit with no profit lock), exit at current
+                # price as before (existing loss-side behavior unchanged).
+                if ts.breakeven_set and (
+                    (is_long and ts.stop_loss >= ts.entry_price) or
+                    (not is_long and ts.stop_loss <= ts.entry_price)
+                ):
+                    exit_price_used = ts.stop_loss  # honor the locked level
+                else:
+                    exit_price_used = price
+                ts.exit_price = exit_price_used
                 ts.exit_time = now_iso
-                ts.pnl_pct = self._calc_pnl(ts, price, self._order_type)
+                ts.pnl_pct = self._calc_pnl(ts, exit_price_used, self._order_type)
                 overshoot = abs(price - ts.stop_loss)
                 ts.stop_overshoot_pct = round((overshoot / ts.entry_price) * 100, 4) if ts.entry_price > 0 else 0
 
@@ -1719,15 +1813,30 @@ class SignalTracker:
                     _hard_cap = _full_ext_age * 1.5  # absolute backstop: 1.5x full extension
                     _mfe_growing = ts.mfe_stale_seconds < 60
 
-                    # ── PHASE 1: Early Kill (first 45-60s) ──
-                    # If trade shows zero life in the first minute, cut it
-                    # RUNNER is exempt (no early kill)
-                    # Early kill: SKIP for Grade A+/A (best signals should not be killed)
-                    _grade_ek = ts.metadata.get("grade", "") if isinstance(ts.metadata, dict) else ""
-                    if early_kill_sec > 0 and age_sec >= early_kill_sec and _grade_ek not in ("A+", "A"):
-                        if max_fav_r < early_kill_mfe and current_r < -0.15:
-                            dead_trade = True
-                            kill_reason = "early_kill"
+                    # ── PHASE 1: Unified dead-signal guard (Phase 5.8) ──
+                    # Replaces the prior early_kill cut (45-60s @ peak<early_kill_mfe
+                    # AND current<-0.15R, B/C only) with the fee-floor + ATR-grace
+                    # guard from execution/exit_guards.py. Same module is called
+                    # from execution/user_real_manager.py and bot/trade_simulator.py
+                    # so paper / real / backtest stay in lockstep.
+                    # See docs/EXIT_GUARD_REFACTOR_5_8.md for the design.
+                    _regime_eg = (
+                        ts.metadata.get("regime", "")
+                        if isinstance(ts.metadata, dict) else ""
+                    )
+                    _eg_reason = should_kill_dead_signal(
+                        age_sec=age_sec,
+                        current_r=current_r,
+                        peak_mfe_r=max_fav_r,
+                        grade=ts.grade,
+                        entry=ts.entry_price,
+                        sl=ts.stop_loss,
+                        trade_type=ts.trade_type,
+                        regime=_regime_eg,
+                    )
+                    if _eg_reason is not None:
+                        dead_trade = True
+                        kill_reason = _eg_reason
 
                     # ── PHASE 1b: Momentum Check (catch dead trades before max_age) ──
                     # RUNNER at 10min with MFE < 0.20R → not a real runner
@@ -2128,6 +2237,26 @@ class SignalTracker:
                 "fill_time_ms": round(ts.fill_time_ms, 1),
                 # Mode tracking
                 "operating_mode": meta.get("operating_mode", "unknown"),
+                # PATCH_O_STEP1_5_22 (2026-05-03) — schema extension for paper-permissive recording.
+                # All fields backward-compatible (default to safe values for currently-recorded signals).
+                # Step 3 will populate vetoes_applied / blocked_reason for VETOED signals.
+                # For now (Step 1): all currently-recorded signals are by definition ADMITTED, so:
+                #   vetoes_applied=[] (admitted signals had no hard vetoes)
+                #   would_execute=True, did_execute=True (they DID execute)
+                #   blocked_reason=None
+                "vetoes_applied":         meta.get("vetoes_applied", []),
+                "vetoes_hard":            meta.get("vetoes_hard", []),
+                "vetoes_soft":            meta.get("vetoes_soft", []),
+                "would_execute":          bool(meta.get("would_execute", True)),
+                "did_execute":            True,  # by definition — recording at trade close
+                "blocked_reason":         meta.get("blocked_reason"),
+                "ml_pass_threshold":      bool(meta.get("ml_pass_threshold", True)),
+                "ml_threshold_at_signal": meta.get("ml_threshold_at_signal"),
+                "p_fill_maker_sim":       meta.get("maker_sim_p_fill"),
+                "expected_fee_type":      meta.get("fee_type", meta.get("expected_fee_type")),
+                "patch_era":              meta.get("patch_era"),
+                "shadow_trade_id":        ts.trade_id,
+                "patch_o_schema_version": "1.0",
             }
             with open(self._live_feedback_file, "a") as f:
                 f.write(json.dumps(feedback, default=str) + "\n")
@@ -2472,8 +2601,25 @@ class SignalTracker:
 
         return None
 
+    @staticmethod
     def _get_trail_params(regime: str, scanner: str = "", trade_type: str = "") -> dict:
         """Get trailing stop parameters based on regime, scanner, and trade type.
+
+        LATENT-BUG FIX (2026-04-16): this method was missing @staticmethod but
+        called at lines 1501/1546/1590 as `self._get_trail_params(...)` which
+        raised TypeError (4 args for a 3-param function). The orchestrator's
+        try/except around update_prices() silently swallowed the error at
+        debug level, which SKIPPED the entire TP1-trail logic path. Effect:
+        after TP1 hit on a winning trade, the remaining 65% position stayed
+        with the ORIGINAL stop_loss (could reverse back to -1R) instead of
+        getting a protective trail.
+
+        Adding @staticmethod restores the intended behavior. Fix is
+        monotonic-to-better for live:
+          - Current: 35% at TP1 locked + 65% floating at original SL
+          - Fixed:   35% at TP1 locked + 65% protected by regime-aware trail
+        Post-deploy monitor live WR for 24h; if it drops >3pp vs
+        baseline (71.3%), revert.
 
         Returns:
             - trail_atr_mult: ATR multiplier for trail distance
@@ -2571,12 +2717,17 @@ class SignalTracker:
 
         is_long = ts.side == "long"
 
+        # HONEST_PAPER_5_22_BIAS1 (2026-05-04) — anchor on fill_price.
+        # Was: PnL computed from ts.entry_price (= signal_price, idealized).
+        # Real: shadow fills happen at fill_price; paper should match.
+        # Falls back to entry_price if fill_price not yet set (pre-fill).
+        _cost_basis = ts.fill_price if (ts.fill_price and ts.fill_price > 0) else ts.entry_price
         # Calculate P&L for each portion
         def pnl_at(price: float) -> float:
             if is_long:
-                return ((price - ts.entry_price) / ts.entry_price) * 100
+                return ((price - _cost_basis) / _cost_basis) * 100
             else:
-                return ((ts.entry_price - price) / ts.entry_price) * 100
+                return ((_cost_basis - price) / _cost_basis) * 100
 
         # Use actual locked PnL from partial closes (35/35/30 split)
         if ts.tp1_pnl_locked != 0 or ts.tp2_pnl_locked != 0:
@@ -2597,7 +2748,10 @@ class SignalTracker:
             gross_pct = pnl_at(exit_price)
 
         # Determine if trade closed within Scalper window
-        scalper_window_sec = 999999 if "BTC" in ts.symbol else 999999
+        # HONEST_PAPER_5_22_BIAS2 (2026-05-04) — real Delta India scalper windows.
+        # Was: scalper_window_sec = 999999 (effectively infinite — wrong).
+        # Real: BTC/ETH 30min, others 15min.
+        scalper_window_sec = 1800 if (ts.symbol.startswith("BTC") or ts.symbol.startswith("ETH")) else 900
         within_scalper = False
         trade_duration_sec = 0
         try:
@@ -2883,13 +3037,14 @@ class SignalTracker:
             by_setup[setup]["mae_values"].append(mae_r)
             by_setup[setup]["mfe_values"].append(mfe_r)
 
-            # Per-symbol stats
+            # Per-symbol stats (READ-ONLY aggregation — not exit logic)
             if symbol not in by_symbol:
-                by_symbol[symbol] = {"total": 0, "wins": 0, "pnl": 0.0}
+                by_symbol[symbol] = {"total": 0, "wins": 0, "pnl": 0.0, "r_values": []}
             by_symbol[symbol]["total"] += 1
             if pnl > 0:
                 by_symbol[symbol]["wins"] += 1
             by_symbol[symbol]["pnl"] += pnl
+            by_symbol[symbol]["r_values"].append(exit_r)
 
         # Calculate win rates + R-metrics per setup
         for setup_data in by_setup.values():
@@ -2923,10 +3078,24 @@ class SignalTracker:
             )
 
         for sym in by_symbol.values():
-            sym["win_rate"] = round(
-                (sym["wins"] / sym["total"] * 100) if sym["total"] else 0, 1
-            )
+            n = sym["total"]
+            sym["win_rate"] = round((sym["wins"] / n * 100) if n else 0, 1)
+            sym["wr"] = sym["win_rate"]  # alias — dashboards expect both keys
             sym["pnl"] = round(sym["pnl"], 2)
+            # R-metrics (same shape as by_setup) — READ-ONLY aggregation
+            r_vals = sym.pop("r_values", [])
+            sym["trades"] = n   # alias — dashboard uses "trades"
+            sym["avg_r"] = round(sum(r_vals) / len(r_vals), 4) if r_vals else 0.0
+            sym["total_r"] = round(sum(r_vals), 4)
+            win_r = [r for r in r_vals if r > 0]
+            loss_r = [r for r in r_vals if r < 0]
+            sym["avg_win_r"] = round(sum(win_r) / len(win_r), 4) if win_r else 0.0
+            sym["avg_loss_r"] = round(sum(loss_r) / len(loss_r), 4) if loss_r else 0.0
+            wr_frac = sym["wins"] / n if n else 0
+            lr_frac = 1 - wr_frac
+            sym["expectancy_r"] = round(
+                wr_frac * sym["avg_win_r"] + lr_frac * sym["avg_loss_r"], 4
+            )
 
         win_count = len(wins)
         loss_count = len(losses)

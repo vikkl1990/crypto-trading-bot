@@ -54,7 +54,8 @@ from strategies.multi_strategy import MultiStrategy
 from risk import RiskManager
 from execution.engine import ExecutionEngine
 from execution.paper_engine import PaperExecutionEngine
-from execution.real_manager import RealTradingManager
+# ARCHIVED 2026-05-02: real_manager.py moved to .archive/legacy/ (RETIRED 2026-04-20)
+# from execution.real_manager import RealTradingManager  # was: line 57
 from alerts import AlertManager
 from journal import TradeJournal
 from dashboard import DashboardServer
@@ -155,14 +156,18 @@ async def build_components(config, mode, symbols, logger):
         execution_engine = PaperExecutionEngine(config_dict)
         logger.info("Paper execution engine active - no real orders.")
 
-    # -- Real Trading Manager (mirrors paper trades to real exchange) --
-    # Always create so dashboard toggle works; starts disabled unless config says otherwise
-    real_manager = RealTradingManager(exchange, config_dict, risk_manager)
-    if real_manager.enabled:
-        mode_str = "DRY RUN" if real_manager.dry_run else "LIVE"
-        logger.warning("*** REAL TRADING MANAGER ACTIVE (%s) — mirrors paper trades ***", mode_str)
-    else:
-        logger.info("Real trading manager initialized (disabled — enable via dashboard or config)")
+    # -- Real Trading Manager — RETIRED (2026-04-20 Option-A consolidation) --
+    # The legacy shared-account RealTradingManager is no longer instantiated.
+    # All per-user real/demo trading is routed through UserRealRegistry
+    # (execution/user_registry.py) which uses each user's own encrypted keys
+    # and honors their users.bot_mode value in PostgreSQL.
+    # Set to None so any getattr-checks (orch, dashboard) degrade gracefully.
+    real_manager = None
+    logger.info(
+        "Legacy RealTradingManager is RETIRED — per-user trading via "
+        "UserRealRegistry + users.bot_mode (PostgreSQL). Users switch modes "
+        "via /profile → Trading → Mode Readiness or /admin → user detail."
+    )
 
     # -- Alerts --
     alert_manager = AlertManager(config_dict)
@@ -192,6 +197,18 @@ async def build_components(config, mode, symbols, logger):
             db_pool = None
     else:
         logger.info("No DATABASE_URL set — using single-user auth mode")
+
+    # -- Inject db_pool into config so BotOrchestrator can create the
+    #    UserRealRegistry (it reads config.get("_db_pool") at __init__).
+    #    BUGFIX 2026-04-21: previously db_pool was local to build_components
+    #    and never reached the orchestrator, so self._user_registry stayed
+    #    None and no qualified signal was ever broadcast to any user's
+    #    UserRealManager — demo/live trades silently blocked at the source.
+    if db_pool is not None:
+        try:
+            config["_db_pool"] = db_pool
+        except Exception:
+            pass
 
     # -- Dashboard --
     dashboard = DashboardServer(auth_service=auth_service, db_pool=db_pool)
@@ -312,6 +329,15 @@ async def async_main(args):
         logger.exception("Fatal error in main loop")
         return 1
     finally:
+        # OPS FIX (2026-04-16): close Postgres pool on shutdown.
+        # Previously not called — connection pool was leaked across restarts,
+        # eventually exhausting Postgres max_connections.
+        try:
+            from db import close_db as _close_db
+            await _close_db()
+            logger.info("Database pool closed.")
+        except Exception as _db_close_err:
+            logger.warning("db.close_db() failed during shutdown: %s", _db_close_err)
         logger.info("Crypto Trading Bot shutdown complete.")
 
     return 0

@@ -41,23 +41,19 @@ class AuthMiddleware:
                     request["user"] = session
             return await handler(request)
 
-        # API requests: GET endpoints are public (read-only trading data)
-        # POST/PUT/DELETE require auth (state-changing operations)
+        # API requests require auth
         cookie = request.cookies.get("vn_session")
-        if cookie:
-            token = cookie.split(":", 1)[0]
-            session = await self.auth_service.verify_session(token)
-            if session:
-                request["user"] = session
-                return await handler(request)
+        if not cookie:
+            return web.json_response({"error": "unauthorized"}, status=401)
 
-        # If not authenticated: allow GET (read-only), block writes
-        if request.method == "GET":
-            # Allow read-only access — dashboard needs data to display
-            return await handler(request)
+        token = cookie.split(":", 1)[0]
+        session = await self.auth_service.verify_session(token)
+        if not session:
+            return web.json_response({"error": "session_expired"}, status=401)
 
-        # POST/PUT/DELETE require auth
-        return web.json_response({"error": "unauthorized"}, status=401)
+        # Inject user info into request
+        request["user"] = session
+        return await handler(request)
 
 
 def require_role(*roles):

@@ -1,31 +1,46 @@
-# VN Edge production Docker image
-FROM python:3.13-slim AS base
+FROM python:3.11-slim
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+LABEL maintainer="cryptobot"
+LABEL description="Crypto Trading Bot"
 
+# Prevent Python from writing .pyc files and enable unbuffered output
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libffi-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
 WORKDIR /app
 
-# System deps for asyncpg + bcrypt
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libpq-dev curl && rm -rf /var/lib/apt/lists/*
-
-# Python deps
+# Copy requirements first for better layer caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# App code
+# Copy application code
 COPY . .
 
-# Run as non-root
-RUN useradd -m -u 1000 vnedge && chown -R vnedge:vnedge /app
-USER vnedge
+# Create necessary directories
+RUN mkdir -p /app/logs /app/data
 
+# Create non-root user
+RUN groupadd -r botuser && useradd -r -g botuser -d /app -s /sbin/nologin botuser
+RUN chown -R botuser:botuser /app
+
+# Switch to non-root user
+USER botuser
+
+# Expose dashboard port
 EXPOSE 8080
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -fs http://localhost:8080/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
 
-CMD ["python3", "main.py"]
+# Run the bot
+CMD ["python", "main.py"]

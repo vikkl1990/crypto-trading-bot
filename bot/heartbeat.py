@@ -112,7 +112,17 @@ class HeartbeatMonitor:
     # well below the true "exchange is down" threshold but tolerates the
     # natural rate of 1m candle closes on low-volume pairs.
     _PREFIX_STALE_OVERRIDES: Dict[str, float] = {
-        "candle_close:": 300.0,  # 5 min for candle_close:{symbol} events
+        # 2026-04-26: bumped 300 → 600s. Observed Heartbeat DEGRADED warnings
+        # firing every minute for ADA, SHIB, LINK, POPCAT, SUI on shadow_live
+        # demo testnet. These low-volume pairs commonly skip 5-7 consecutive
+        # 1m candle closes during quiet sessions. 600s tolerance still well
+        # below "exchange is down" but eliminates the noise. Real degradation
+        # (>10 min stale) still triggers properly.
+        "candle_close:": 600.0,
+        # heartbeat_log is only recorded once per HEARTBEAT_LOG_INTERVAL (300s).
+        # Tolerance must be >= interval + buffer to avoid every-tick warnings.
+        # 2026-04-26: 90s was 5x too tight — bumped to 360s (interval + 60s).
+        "heartbeat_log": 360.0,
     }
 
     def get_stale_components(self) -> list[str]:
